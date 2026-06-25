@@ -1610,12 +1610,9 @@ def handle_entry(payload: dict):
     side = "Buy" if direction == "BUY" else "Sell"
     opp_side = "Sell" if side == "Buy" else "Buy"
 
-    # Дефолты по бирже: Bybit = 10x / 1 USDT, BingX = 20x / 30 USDT
-    exchange_defaults = {
-        "bybit": {"leverage": 10,  "size_usdt": 1.0},
-        "bingx": {"leverage": 20,  "size_usdt": 30.0},
-    }
-    ex_def = exchange_defaults.get(exchange, {"leverage": DEFAULT_LEVERAGE, "size_usdt": DEFAULT_SIZE_USDT})
+    # Дефолты берутся из ENV: DEFAULT_LEVERAGE / DEFAULT_SIZE_USDT (без хардкода).
+    # PAIR_SETTINGS_JSON по-прежнему перекрывает их для конкретной пары.
+    ex_def = {"leverage": DEFAULT_LEVERAGE, "size_usdt": DEFAULT_SIZE_USDT}
     cfg = {**ex_def, **PAIR_SETTINGS.get(ticker, {})}
     leverage  = int(cfg["leverage"])
     size_usdt = float(cfg["size_usdt"])
