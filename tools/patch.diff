@@ -1,0 +1,261 @@
+--- statham-src/statham-bot-main/app.py	2026-05-01 12:08:33.000000000 +0000
++++ statham-patched/app.py	2026-05-16 19:52:01.167437703 +0000
+@@ -1066,14 +1066,18 @@
+ 
+ 
+ def update_stats(result: str):
+-    """result: 'win' | 'loss' | 'partial' (partial treated as loss for stats)."""
++    """result: 'win' | 'loss' | 'partial'
++    BUG #5 FIX: partial = SL после TP1+ = прибыльная сделка → считается как WIN в WR.
++    stats.wins  = full TP wins + partial wins
++    stats.losses = pure SL (0 TP hits)
++    """
+     with _state_lock:
+         s = load_stats()
+         s["total"] = s.get("total", 0) + 1
+-        if result == "win":
++        if result in ("win", "partial"):
+             s["wins"] = s.get("wins", 0) + 1
+         else:
+-            s["losses"] = s.get("losses", 0) + 1  # partial counts as loss
++            s["losses"] = s.get("losses", 0) + 1
+         save_stats(s)
+ 
+ 
+@@ -1215,19 +1219,19 @@
+     # ── Разбивка по TP: считаем highest_tp_hit для всех закрытых сделок ─
+     # "wins" (TP6/remaining=0) и "partials" (SL после TP1-N) — обе считаются
+     tp_counts: dict = {}      # {tp_num: count}
+-    tp_pnl_sums: dict = {}    # {tp_num: [pnl_pct, ...]}
++    tp_pnl_sums: dict = {}    # {tp_num: [tp_pnl_pct, ...]}  ← BUG #6 FIX: tp_pnl_pct не pnl_pct
+     for r in wins + partials:
+         # highest_tp_hit — максимальный достигнутый TP (для partial это TP1-5)
+         n = int(r.get("highest_tp_hit") or r.get("tp_num") or 0)
+         if n:
+             tp_counts[n] = tp_counts.get(n, 0) + 1
+-        # Collect P&L by highest TP
++        # BUG #6 FIX: используем tp_pnl_pct (только доход от TP-частей, без SL-хвоста)
+         pnl_data = r.get("pnl", {})
+-        # Skip zero P&L (entry_price was None → meaningless average)
+-        if pnl_data and n and pnl_data.get("pnl_pct", 0) != 0.0:
++        tp_part = pnl_data.get("tp_pnl_pct", None) if pnl_data else None
++        if tp_part is not None and tp_part != 0.0 and n:
+             if n not in tp_pnl_sums:
+                 tp_pnl_sums[n] = []
+-            tp_pnl_sums[n].append(pnl_data.get("pnl_pct", 0))
++            tp_pnl_sums[n].append(tp_part)
+     # Also count pure SL losses (no TP hit) as TP0
+     sl_only = [r for r in losses if not (r.get("highest_tp_hit") or r.get("tp_num"))]
+ 
+@@ -1239,7 +1243,8 @@
+ 
+     # ── Основные цифры ───────────────────────────────────────────────
+     text += f"📊 Win Rate: <b>{_wr_icon(wr)} {wr}%</b>\n"
+-    text += f"✅ TP: {len(wins)}   ❌ SL: {len(losses)}   🔶 Partial: {len(partials)}" if partials else f"✅ TP: {len(wins)}   ❌ SL: {len(losses)}"
++    # BUG #6 FIX: правильные метки — Full TP / Partial / Pure SL
++    text += (f"🏆 Full TP: {len(wins)}   🔶 Partial: {len(partials)}   ❌ Pure SL: {len(losses)}")
+     if manuals:
+         text += f"   🧯 Manual: {len(manuals)}"
+     text += f"\n📈 Всего закрыто: <b>{total}</b>\n"
+@@ -1872,6 +1877,10 @@
+         )
+     if final_close:
+         # Position fully closed at TP6 (or remaining ≤ min_qty)
++        # BUG #9 FIX: pos_snapshot уже содержит tp{tp_num}_hit=True (установлено на строке 1843)
++        # но дополнительно гарантируем что текущий TP флаг присутствует в snapshot
++        if not pos_snapshot.get(f"tp{tp_num}_hit"):
++            pos_snapshot[f"tp{tp_num}_hit"] = True
+         pnl = calc_trade_pnl(pos_snapshot, None)
+         _entry_fc = pos_snapshot.get("entry_price", 0)
+         _dirn_fc  = pos_snapshot.get("direction", "?")
+@@ -1934,22 +1943,33 @@
+     reply_id = (trade or {}).get("message_id") or pos_snapshot.get("message_id")
+ 
+     # ── Рассчитываем реальный P&L в боте (не доверяем Pine Script +0%) ──────
+-    # BUG 3 FIX: Pine Script nulls all price fields in sl_hit alert — we use pos_snapshot
++    # BUG #3 FIX: Pine Script nulls all price fields in sl_hit alert — we use pos_snapshot
+     # (loaded from Redis) which always has entry_price, leverage, tp prices etc.
+     # sl_exit_price is extracted from Pine Script text, or from payload "exit_price" field.
++
++    # BUG #7 FIX: убираем "Price:" fallback — он матчит Entry Price / TP Price / Trigger Price
++    # и даёт положительный P&L для убыточных SL-сделок (KSMUSDT +6.07%, BANANAS31 +120%, etc.)
+     sl_exit_price = None
+     if text:
+         sl_exit_price = (
+             parse_price(text, "Цена выхода:", "💰 Цена выхода:")
+-            or parse_price(text, "Exit:", "exit:")
+-            or parse_price(text, "Price:", "price:")
++            or parse_price(text, "Exit price:", "Exit price:")
++            # НЕ добавляем "Exit:" — может матчить "Exit signal" и пр. нечисловой текст
++            # НЕ добавляем "Price:" — слишком широкий, ловит Entry Price, TP Price, Trigger Price
+         )
+-    # Also check JSON payload for exit_price field
++    # Also check JSON payload for exit_price field (с санити-чеком диапазона)
+     if not sl_exit_price:
+         try:
+             _ep = payload.get("exit_price") or payload.get("close_price")
+             if _ep and str(_ep).lower() not in ("null", "none", "nan", ""):
+-                sl_exit_price = float(_ep)
++                _ep_f = float(_ep)
++                # BUG #7 FIX: санити-чек — exit_price должен быть в ±50% от entry
++                # иначе это, скорее всего, неправильное поле (TP price вместо SL exit)
++                _entry_chk = pos_snapshot.get("entry_price", 0) if pos_snapshot else 0
++                if _entry_chk > 0 and 0.5 * _entry_chk < _ep_f < 2.0 * _entry_chk:
++                    sl_exit_price = _ep_f
++                elif _entry_chk <= 0:
++                    sl_exit_price = _ep_f  # нет базы для сравнения — берём как есть
+         except Exception:
+             pass
+     # If still missing, use sl_price from position as approximation
+@@ -1960,6 +1980,28 @@
+             write_log(f"SL_EXIT_APPROX | {ticker} | using stored sl_price={sl_exit_price}")
+     write_log(f"PNL_CALC | {ticker} | entry={pos_snapshot.get('entry_price')} sl_exit={sl_exit_price} lev={pos_snapshot.get('leverage')}")
+     pnl = calc_trade_pnl(pos_snapshot, sl_exit_price)
++
++    # BUG #7 FIX: Санити-чек P&L после расчёта
++    # Для ЧИСТОГО SL (нет ни одного TP hit, нет trail) P&L обязан быть ≤ 0%
++    # Положительный — признак того, что sl_exit_price = TP-цена из "Price:" паттерна
++    _trail_active_snap = (pos_snapshot or {}).get("trail_active", False)
++    if not _trail_active_snap and highest_tp == 0 and pnl.get("pnl_pct", 0) > 1.0:
++        write_log(
++            f"PNL_SANITY_FAIL | {ticker} | pnl={pnl['pnl_pct']}% при чистом SL без TP — "
++            f"sl_exit_price={sl_exit_price} скорее всего неверна → пересчёт по sl_price"
++        )
++        _sl_fallback = pos_snapshot.get("sl_price") or pos_snapshot.get("trail_sl")
++        if _sl_fallback:
++            sl_exit_price = float(_sl_fallback)
++            pnl = calc_trade_pnl(pos_snapshot, sl_exit_price)
++            write_log(f"PNL_SANITY_RESET | {ticker} | пересчитано по sl_price={sl_exit_price} → pnl={pnl['pnl_pct']}%")
++        else:
++            # Нет данных — обнуляем чтобы не засорять статистику фантомными цифрами
++            pnl = {"pnl_pct": 0.0, "pnl_pct_no_lev": 0.0,
++                   "tp_pnl_pct": 0.0, "sl_pnl_pct": 0.0,
++                   "highest_tp": 0, "tps_hit": [],
++                   "remaining_pct": 0.0, "closed_on_tp_pct": 0.0}
++            write_log(f"PNL_SANITY_ZERO | {ticker} | sl_price отсутствует → P&L обнулён")
+     _exchange_sl  = pos_snapshot.get("exchange", "bybit")
+     _lev          = pos_snapshot.get("leverage", 1)
+     _dirn         = pos_snapshot.get("direction", "?")
+@@ -2010,10 +2052,12 @@
+         # Пересылаем оригинальный текст Pine Script для сравнения
+         write_log(f"SL_HIT_PINESCRIPT_TEXT | {ticker} | {text[:120]}")
+ 
+-    # FIX 5: result type
+-    if highest_tp > 0 and _exchange_sl != "none":
+-        result = "win"
+-    elif highest_tp > 0 and _exchange_sl == "none":
++    # BUG #1 FIX: SL-выход НИКОГДА не является "win".
++    # "win" = позиция закрыта ПОЛНОСТЬЮ на TP (handle_tp_hit при remaining ≤ min_qty).
++    # "partial" = был хотя бы один TP hit, затем SL (прибыльная неполная сделка).
++    # "loss"    = чистый SL без единого TP hit.
++    # Независимо от биржи (exchange/none) — логика одинаковая.
++    if highest_tp > 0:
+         result = "partial"
+     else:
+         result = "loss"
+@@ -2651,6 +2695,8 @@
+             "/emergency_stop — стоп сигналов\n"
+             "/resume — снять стоп\n"
+             "/reset_stats — сбросить статистику\n"
++            "/recalc_stats — пересчёт stats из истории ← BUG#8 FIX\n"
++            "/retro_fix — коррекция старых win→partial ← BUG#1 FIX\n"
+             "/cleanup — удалить зависшие сделки\n"
+             "/clean — очистить trades+positions\n"
+             "/logs — последние строки лога\n/diagnostics — проверка всех API\n/redis_fix — переподключить Redis\n/redis_info — статус Redis + ключи\n/redis_clear_history — очистить историю\n/redis_clear_all — очистить всё Redis\n/sync — сверить позиции с биржами\n/pnl — Live P&L открытых позиций"
+@@ -2738,10 +2784,10 @@
+             f"📊 <b>Статистика Statham Strategy</b>\n\n"
+             f"{_wr_icon(wr)} Win Rate: <b>{wr}%</b>"
+             f"  <i>({wins + _partials_cnt}/{wins + _partials_cnt + losses})</i>\n"
+-            f"✅ TP закрыты полностью: {wins}\n"
++            f"🏆 Full TP закрыты: {wins}\n"
+             f"🔶 Partial (TP+SL): {len(_partials_all)}\n"
+-            f"✅ TP (≥TP3 хит): {tp3plus}\n"
+-            f"❌ SL всего: {losses}\n"
++            f"✅ Из них TP ≥3 хит: {tp3plus}\n"
++            f"❌ Pure SL: {losses}\n"
+             f"📈 Всего закрыто: <b>{total}</b>"
+             f"{pnl_line}"
+             f"{tp_breakdown}"
+@@ -3078,6 +3124,82 @@
+         save_stats({"wins": 0, "losses": 0, "total": 0})
+         _reply(m, "🔄 Статистика сброшена.")
+ 
++    # ══════════════════════════════════════════════════════════════════
++    # BUG #8 FIX: /recalc_stats — пересчёт trade_stats из реальной истории
++    # Решает проблему некорректного Redis-счётчика (partial → loss → wins=36 вместо ~90)
++    # ══════════════════════════════════════════════════════════════════
++    @bot.message_handler(commands=["recalc_stats"])
++    def cmd_recalc_stats(m):
++        if not is_admin_user(m.from_user.id):
++            _reply(m, "⛔ Нет доступа."); return
++        history = load_history()
++        wins_full    = 0  # result == "win" (полное TP-закрытие)
++        wins_partial = 0  # result == "partial" (TP + SL)
++        losses       = 0  # result == "loss" (чистый SL)
++        manuals      = 0  # result == "manual"
++        for r in history:
++            res = r.get("result", "")
++            if res == "win":
++                wins_full += 1
++            elif res == "partial":
++                wins_partial += 1
++            elif res == "loss":
++                losses += 1
++            elif res == "manual":
++                manuals += 1
++        total = wins_full + wins_partial + losses + manuals
++        new_stats = {
++            "wins":           wins_full + wins_partial,
++            "losses":         losses,
++            "total":          total,
++            "_wins_full":     wins_full,
++            "_wins_partial":  wins_partial,
++            "_losses":        losses,
++            "_manuals":       manuals,
++        }
++        save_stats(new_stats)
++        wr = calc_winrate(wins_full + wins_partial, total)
++        write_log(
++            f"RECALC_STATS | from {len(history)} records | "
++            f"wins_full={wins_full} partial={wins_partial} losses={losses} total={total} WR={wr}%"
++        )
++        _reply(m, (
++            f"✅ <b>Статистика пересчитана</b> из {len(history)} записей истории\n\n"
++            f"🏆 Full TP: <b>{wins_full}</b>\n"
++            f"🔶 Partial (TP+SL): <b>{wins_partial}</b>\n"
++            f"❌ Pure SL: <b>{losses}</b>\n"
++            f"🧯 Manual: <b>{manuals}</b>\n"
++            f"📈 Всего: <b>{total}</b>\n\n"
++            f"📊 Win Rate: {_wr_icon(wr)} <b>{wr}%</b>"
++        ))
++
++    # ══════════════════════════════════════════════════════════════════
++    # BUG #1 RETRO FIX: /retro_fix — коррекция старых "win" в истории
++    # Меняет записи close_reason=sl_hit + result="win" → "partial"
++    # Запускать ОДИН РАЗ после деплоя патча, затем /recalc_stats
++    # ══════════════════════════════════════════════════════════════════
++    @bot.message_handler(commands=["retro_fix"])
++    def cmd_retro_fix(m):
++        if not is_admin_user(m.from_user.id):
++            _reply(m, "⛔ Нет доступа."); return
++        with _state_lock:
++            history = load_history()
++            fixed = 0
++            for r in history:
++                if (r.get("close_reason") == "sl_hit"
++                        and r.get("result") == "win"
++                        and int(r.get("highest_tp_hit") or r.get("tp_num") or 0) > 0):
++                    r["result"] = "partial"
++                    fixed += 1
++            save_history(history)
++        write_log(f"RETRO_FIX | fixed {fixed} records win→partial")
++        _reply(m, (
++            f"✅ <b>Ретро-коррекция завершена</b>\n\n"
++            f"Исправлено win→partial: <b>{fixed}</b>\n"
++            f"<i>(close_reason=sl_hit + highest_tp_hit>0)</i>\n\n"
++            f"Теперь запусти /recalc_stats для обновления Redis-счётчика."
++        ))
++
+     @bot.message_handler(commands=["cleanup"])
+     def cmd_cleanup(m):
+         if not is_admin_user(m.from_user.id):
