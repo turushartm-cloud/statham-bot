@@ -191,8 +191,9 @@ def _parse_pair_settings(raw: str) -> dict:
 PAIR_SETTINGS: dict = _parse_pair_settings(os.environ.get("PAIR_SETTINGS_JSON", "{}"))
 
 # TP_CLOSE_PCT: распределение частичных закрытий по уровням TP
-# TP1-2: 60% объёма быстрый выход, TP3: 20% — основная цель, TP4-6: 20% runner
-TP_CLOSE_PCT = {1: 0.30, 2: 0.30, 3: 0.20, 4: 0.07, 5: 0.03, 6: 0.10}
+# ✅ EDGE-FIX: 4 TP, «прибыль течёт» — только 45% выходит у входа (TP1+TP2),
+# 55% бежит до TP3/TP4 (3.5R/5R). TP5/TP6 отключены (0) → нет dust-ордеров (110422).
+TP_CLOSE_PCT = {1: 0.20, 2: 0.25, 3: 0.30, 4: 0.25, 5: 0.0, 6: 0.0}
 
 
 def calc_trade_pnl(pos: dict, sl_exit_price: float | None = None) -> dict:
@@ -869,6 +870,54 @@ def bingx_cancel_all(ticker: str):
     except Exception as e:
         write_log(f"BINGX_CANCEL_ERR | {ticker} | {e}")
 
+
+def _bingx_order_id(resp: dict) -> str:
+    """Достаёт orderId из ответа BingX устойчиво: data.order.orderId ИЛИ data.orderId."""
+    d = resp.get("data", {}) or {}
+    o = d.get("order", {}) or {}
+    return str(o.get("orderId") or d.get("orderId") or "")
+
+
+def bingx_cancel_order_by_id(ticker: str, order_id) -> None:
+    """Отменяет ОДИН ордер по его orderId. Не трогает остальные."""
+    if not order_id or str(order_id) in ("ok", ""):
+        return
+    sym = _bingx_to_symbol(ticker)
+    try:
+        _bingx_req("DELETE", "/openApi/swap/v2/trade/order",
+                   {"symbol": sym, "orderId": str(order_id)})
+    except Exception as e:
+        write_log(f"BINGX_CANCEL_ID_WARN | {ticker} id={order_id} | {e}")
+
+
+def cancel_own_orders(pos: dict) -> None:
+    """🔒 БЕЗОПАСНО: отменяет ТОЛЬКО ордера, которые бот сам выставил для ЭТОЙ позиции
+    (по сохранённым в Redis orderId: sl_order_id + tp_order_ids). Ручные ордера юзера
+    физически не могут попасть под отмену — их id нет в записи позиции.
+    Заменяет опасный ex_cancel_all, который сносил ВСЕ ордера по символу."""
+    if not pos:
+        return
+    exchange = pos.get("exchange", "bybit")
+    if exchange == "none":
+        return
+    ticker = pos.get("symbol", "")
+    ids = []
+    if pos.get("sl_order_id"):
+        ids.append(pos["sl_order_id"])
+    tp_ids = pos.get("tp_order_ids") or {}
+    if isinstance(tp_ids, dict):
+        ids.extend(v for v in tp_ids.values() if v)
+    for oid in ids:
+        if str(oid) in ("ok", ""):
+            continue  # id не сохранён (старый парсинг) — пропускаем, чужое НЕ трогаем
+        if exchange == "bingx":
+            bingx_cancel_order_by_id(ticker, oid)
+        else:
+            try:
+                bybit().cancel_order(category="linear", symbol=ticker, orderId=str(oid))
+            except Exception as e:
+                write_log(f"BYBIT_CANCEL_ID_WARN | {ticker} id={oid} | {e}")
+
 def get_bingx_balance() -> str:
     try:
         if BINGX_DEMO:
@@ -1027,7 +1076,7 @@ def place_tp_orders(ticker: str, side: str, opp_side: str, total_qty: float,
                 if bx_qty < 0.001:
                     continue
                 resp = bingx_place_tp(ticker, opp_side, bx_qty, price)
-                order_ids[tp_num] = resp.get("data", {}).get("orderId", "") or "ok"
+                order_ids[tp_num] = _bingx_order_id(resp) or "ok"
         except Exception as e:
             write_log(f"TP_ORDER_ERR | {ticker} TP{tp_num} ({exchange}) | {e}")
         time.sleep(0.15)
@@ -1063,14 +1112,14 @@ def move_sl(pos: dict, new_sl: float) -> str:
     # Не трогаем позиции без биржи или с нулевым объёмом
     if exchange == "none" or remaining <= 0:
         return ""
-    ex_cancel_all(symbol, exchange)
+    cancel_own_orders(pos)  # 🔒 только свои ордера этой позиции, не ручные юзера
     time.sleep(0.3)
     try:
         resp = ex_place_stop(symbol, opp_side, remaining, new_sl, exchange)
         if exchange == "bybit" and resp.get("retCode") == 0:
             return resp["result"].get("orderId", "")
         elif exchange == "bingx":
-            return resp.get("data", {}).get("orderId", "") or "ok"
+            return _bingx_order_id(resp) or "ok"
     except Exception as e:
         write_log(f"SL_MOVE_ERR | {symbol} ({exchange}) | {e}")
     return ""
@@ -1719,7 +1768,7 @@ def handle_entry(payload: dict):
                 if exchange == "bybit" and resp.get("retCode") == 0:
                     sl_order_id = resp["result"].get("orderId", "")
                 elif exchange == "bingx":
-                    sl_order_id = resp.get("data", {}).get("orderId", "") or "ok"
+                    sl_order_id = _bingx_order_id(resp) or "ok"
             except Exception as e:
                 write_log(f"SL_PLACE_ERR | {ticker} ({exchange}) | {e}")
 
@@ -1908,7 +1957,7 @@ def handle_tp_hit(payload: dict):
 
             if new_remaining <= min_q or tp_num >= 6:
                 if exchange != "none":
-                    ex_cancel_all(ticker, exchange)
+                    cancel_own_orders(pos)  # 🔒 только свои ордера, не ручные юзера
                 positions.pop(pkey, None)
                 final_close = True
             else:
@@ -1984,7 +2033,7 @@ def handle_sl_hit(payload: dict):
             highest_tp = _highest_tp_hit(pos)
             pos_snapshot = dict(pos)
             if exchange != "none":
-                ex_cancel_all(ticker, exchange)
+                cancel_own_orders(pos)  # 🔒 только свои ордера, не ручные юзера
             positions.pop(pkey, None)
             save_positions(positions)
 
@@ -2169,7 +2218,7 @@ def close_position_manually(pos: dict, source: str) -> tuple[bool, str]:
     if remaining > 0:
         try:
             if exchange != "none":
-                ex_cancel_all(ticker, exchange)
+                cancel_own_orders(pos)  # 🔒 только свои ордера, не ручные юзера
                 ex_place_market(ticker, pos["opp_side"], remaining, True, exchange)
         except Exception as e:
             write_log(f"MANUAL_CLOSE_ERR | {ticker} | {e}")
