@@ -4,4 +4,4 @@ pybit==5.8.0
 gunicorn==22.0.0
 pyTelegramBotAPI==4.18.0
 redis==5.0.8
-pandas==2.2.2
+# pandas==2.2.2
