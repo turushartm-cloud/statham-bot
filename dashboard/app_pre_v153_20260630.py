@@ -37,7 +37,6 @@ PNL_ALERT_THRESHOLD = float(os.environ.get("PNL_ALERT_THRESHOLD", "-5.0"))
 _REDIS_PREFIX      = "statham:"
 
 _redis_client = None
-MSK_TZ = timezone(timedelta(hours=3))
 
 def _get_redis():
     global _redis_client
@@ -84,13 +83,13 @@ def require_secret(f):
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 def _msk_now():
-    return datetime.now(MSK_TZ)
+    return datetime.now(timezone.utc) + timedelta(hours=3)
 
 def _ts_to_msk(ts):
     if not ts:
         return ""
     try:
-        return datetime.fromtimestamp(int(ts), tz=timezone.utc).astimezone(MSK_TZ).strftime("%Y-%m-%d %H:%M")
+        return (datetime.fromtimestamp(int(ts), tz=timezone.utc) + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M")
     except Exception:
         return ""
 
@@ -109,13 +108,8 @@ def _period_cutoff(period: str) -> float:
 def _filter_history(history: list, period: str, direction: str) -> list:
     cutoff = _period_cutoff(period)
     result = []
-    for r in history if isinstance(history, list) else []:
-        if not isinstance(r, dict):
-            continue
-        try:
-            ct = float(r.get("close_time", 0) or 0)
-        except (TypeError, ValueError):
-            continue
+    for r in history:
+        ct = r.get("close_time", 0) or 0
         if ct < cutoff:
             continue
         dr = (r.get("direction") or "").upper()
@@ -131,84 +125,27 @@ def _today_msk_start() -> float:
     midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
     return midnight.timestamp()
 
-def _safe_pnl(record: dict) -> float | None:
-    """Return a finite leveraged trade return, including valid zero values."""
-    try:
-        value = (record.get("pnl") or {}).get("pnl_pct")
-        value = float(value)
-        return value if math.isfinite(value) else None
-    except (TypeError, ValueError, AttributeError):
-        return None
-
-def _record_highest_tp(record: dict) -> int:
-    """Combine execution and summary evidence without trusting legacy tp_num."""
-    candidates = []
-    pnl = record.get("pnl")
-    if isinstance(pnl, dict):
-        hits = pnl.get("tps_hit")
-        if isinstance(hits, list):
-            for value in hits:
-                try:
-                    candidates.append(int(value))
-                except (TypeError, ValueError):
-                    pass
-        if "highest_tp" in pnl:
-            try:
-                candidates.append(int(pnl.get("highest_tp") or 0))
-            except (TypeError, ValueError):
-                pass
-    if "highest_tp_hit" in record:
-        try:
-            candidates.append(int(record.get("highest_tp_hit") or 0))
-        except (TypeError, ValueError):
-            pass
-    elif "tp_num" in record:
-        try:
-            candidates.append(int(record.get("tp_num") or 0))
-        except (TypeError, ValueError):
-            pass
-    return max(0, max(candidates, default=0))
-
-def _position_items(positions) -> list[tuple[str, dict]]:
-    """Accept the live Redis mapping and exported list representation."""
-    if isinstance(positions, dict):
-        return [(str(k), v) for k, v in positions.items() if isinstance(v, dict)]
-    if isinstance(positions, list):
-        return [(str(i), v) for i, v in enumerate(positions) if isinstance(v, dict)]
-    return []
-
 def _calc_stats(trades: list) -> dict:
     wins     = [r for r in trades if r.get("result") == "win"]
     losses   = [r for r in trades if r.get("result") == "loss"]
     partials = [r for r in trades if r.get("result") == "partial"]
     manuals  = [r for r in trades if r.get("result") == "manual"]
     total = len(wins) + len(losses) + len(partials)
-    pnl_pairs = [(r, _safe_pnl(r)) for r in trades]
-    pnl_vals = [p for _, p in pnl_pairs if p is not None]
-    profitable = sum(1 for _, p in pnl_pairs if p is not None and p > 0.0)
-    net_losses = sum(1 for _, p in pnl_pairs if p is not None and p < 0.0)
-    breakeven = sum(1 for _, p in pnl_pairs if p == 0.0)
-    pnl_scored = len(pnl_vals)
-    wr = round(profitable / pnl_scored * 100, 1) if pnl_scored else 0.0
+    profitable = len(wins) + len(partials)
+    wr = round(profitable / total * 100, 1) if total else 0.0
 
+    pnl_vals = [r["pnl"]["pnl_pct"] for r in trades if r.get("pnl") and r["pnl"].get("pnl_pct") != 0.0]
     total_pnl = round(sum(pnl_vals), 2) if pnl_vals else 0.0
     avg_pnl = round(sum(pnl_vals) / len(pnl_vals), 2) if pnl_vals else 0.0
 
-    # tp_counts means "reached this level" (cumulative), not an exclusive
-    # highest-TP bucket. This makes TP1 >= TP2 >= TP3 >= TP4 by definition.
-    tp_counts = {n: 0 for n in range(1, 5)}
-    highest_tp_counts = {}
-    sl_records = [r for r in trades if r.get("close_reason") == "sl_hit"]
-    sl_count = len(sl_records)
-    pure_sl_count = sum(1 for r in sl_records if _record_highest_tp(r) == 0)
-    be_count = sum(1 for r in sl_records if r.get("be_active"))
+    tp_counts = {}
+    sl_count = len(losses)
+    be_count = sum(1 for r in losses if r.get("be_active"))
 
     for r in wins + partials:
-        highest = min(4, _record_highest_tp(r))
-        if highest > 0:
-            highest_tp_counts[highest] = highest_tp_counts.get(highest, 0) + 1
-            for n in range(1, highest + 1):
-                tp_counts[n] += 1
+        n = int(r.get("highest_tp_hit") or r.get("tp_num") or 0)
+        if n > 0:
+            tp_counts[n] = tp_counts.get(n, 0) + 1
 
     # P&L by day for chart
     daily_pnl: dict = {}
@@ -216,44 +153,29 @@ def _calc_stats(trades: list) -> dict:
         ct = r.get("close_time", 0)
         if not ct:
             continue
-        day = datetime.fromtimestamp(ct, tz=timezone.utc).astimezone(MSK_TZ).strftime("%Y-%m-%d")
-        pnl = _safe_pnl(r)
-        if pnl is not None:
-            daily_pnl[day] = round(daily_pnl.get(day, 0) + pnl, 2)
+        day = (datetime.fromtimestamp(ct, tz=timezone.utc) + timedelta(hours=3)).strftime("%Y-%m-%d")
+        pnl = (r.get("pnl") or {}).get("pnl_pct", 0) or 0
+        daily_pnl[day] = round(daily_pnl.get(day, 0) + pnl, 2)
 
     # Today stats
     today_cutoff = _today_msk_start()
     today_trades = [r for r in trades if (r.get("close_time") or 0) >= today_cutoff]
-    today_pnl_vals = [p for p in (_safe_pnl(r) for r in today_trades) if p is not None]
+    today_pnl_vals = [r["pnl"]["pnl_pct"] for r in today_trades if r.get("pnl") and r["pnl"].get("pnl_pct") != 0.0]
     today_pnl = round(sum(today_pnl_vals), 2) if today_pnl_vals else 0.0
-    today_wins = sum(1 for r in today_trades if (_safe_pnl(r) or 0.0) > 0.0)
-    today_losses = sum(1 for r in today_trades if (_safe_pnl(r) or 0.0) < 0.0)
-    today_tp = {n: 0 for n in range(1, 5)}
-    today_sl_records = [r for r in today_trades if r.get("close_reason") == "sl_hit"]
-    today_sl = len(today_sl_records)
-    today_be = sum(1 for r in today_sl_records if r.get("be_active"))
+    today_wins = sum(1 for r in today_trades if r.get("result") in ("win", "partial"))
+    today_losses = sum(1 for r in today_trades if r.get("result") == "loss")
+    today_tp = {}
+    today_sl = 0
+    today_be = 0
     for r in today_trades:
         if r.get("result") in ("win", "partial"):
-            highest = min(4, _record_highest_tp(r))
-            for n in range(1, highest + 1):
-                today_tp[n] += 1
-
-    negative_partials = sum(1 for r, p in pnl_pairs if r.get("result") == "partial" and p is not None and p <= 0.0)
-    positive_losses = sum(1 for r, p in pnl_pairs if r.get("result") == "loss" and p is not None and p > 0.0)
-    legacy_tp_above_4 = sum(1 for r in trades if int(r.get("highest_tp_hit") or 0) > 4)
-    tp_summary_disagreements = sum(
-        1 for r in trades
-        if int(r.get("highest_tp_hit") or 0) != int((r.get("pnl") or {}).get("highest_tp") or 0)
-        and isinstance(r.get("pnl"), dict)
-    )
-    quality = {
-        "pnl_known": pnl_scored,
-        "pnl_missing": len(trades) - pnl_scored,
-        "negative_partials": negative_partials,
-        "positive_losses": positive_losses,
-        "legacy_tp_above_4": legacy_tp_above_4,
-        "tp_summary_disagreements": tp_summary_disagreements,
-    }
+            n = int(r.get("highest_tp_hit") or r.get("tp_num") or 0)
+            if n > 0:
+                today_tp[n] = today_tp.get(n, 0) + 1
+        elif r.get("result") == "loss":
+            today_sl += 1
+            if r.get("be_active"):
+                today_be += 1
 
     return {
         "total": total + len(manuals),
@@ -262,17 +184,11 @@ def _calc_stats(trades: list) -> dict:
         "partials": len(partials),
         "manuals": len(manuals),
         "profitable": profitable,
-        "net_losses": net_losses,
-        "breakeven": breakeven,
-        "pnl_scored": pnl_scored,
         "win_rate": wr,
-        "pnl_sum_pct": total_pnl,
         "total_pnl": total_pnl,
         "avg_pnl": avg_pnl,
         "tp_counts": tp_counts,
-        "highest_tp_counts": highest_tp_counts,
         "sl_count": sl_count,
-        "pure_sl_count": pure_sl_count,
         "be_count": be_count,
         "daily_pnl": dict(sorted(daily_pnl.items())),
         "today_pnl": today_pnl,
@@ -282,20 +198,15 @@ def _calc_stats(trades: list) -> dict:
         "today_sl": today_sl,
         "today_be": today_be,
         "today_total": len(today_trades),
-        "quality": quality,
     }
 
-def _build_breakdown(history: list, positions=None) -> list:
+def _build_breakdown(history: list) -> list:
     """Build Long/Short/Both breakdown rows."""
     rows = []
     for label, dr_filter in [("LONG", "BUY"), ("SHORT", "SELL"), ("BOTH", None)]:
         filtered = [r for r in history if dr_filter is None or (r.get("direction") or "").upper() == dr_filter]
         s = _calc_stats(filtered)
-        open_count = sum(
-            1 for _, p in _position_items(positions)
-            if dr_filter is None or (p.get("direction") or "").upper() == dr_filter
-        )
-        rows.append({"label": label, "open_count": open_count, **s})
+        rows.append({"label": label, **s})
     return rows
 
 # ── API Endpoints ──────────────────────────────────────────────────────────────
@@ -308,18 +219,19 @@ def api_stats():
     history = redis_get("trade_history") or []
     filtered = _filter_history(history, period, direction)
     stats = _calc_stats(filtered)
+    breakdown = _build_breakdown(filtered)
+
+    # Open positions count
     positions = redis_get("positions") or {}
-    position_items = _position_items(positions)
-    breakdown = _build_breakdown(filtered, positions)
-    open_longs  = sum(1 for _, p in position_items if (p.get("direction") or "").upper() == "BUY")
-    open_shorts = sum(1 for _, p in position_items if (p.get("direction") or "").upper() == "SELL")
+    open_longs  = sum(1 for p in positions.values() if (p.get("direction") or "").upper() == "BUY")
+    open_shorts = sum(1 for p in positions.values() if (p.get("direction") or "").upper() == "SELL")
 
     return jsonify({
         "stats": stats,
         "breakdown": breakdown,
         "open_longs": open_longs,
         "open_shorts": open_shorts,
-        "open_total": len(position_items),
+        "open_total": len(positions),
     })
 
 @app.route("/api/positions")
@@ -327,7 +239,7 @@ def api_stats():
 def api_positions():
     positions = redis_get("positions") or {}
     result = []
-    for pkey, pos in _position_items(positions):
+    for pkey, pos in positions.items():
         result.append({
             "pkey": pkey,
             "ticker": pos.get("symbol") or pos.get("ticker", ""),
@@ -338,6 +250,8 @@ def api_positions():
             "tp2": pos.get("tp2_price"),
             "tp3": pos.get("tp3_price"),
             "tp4": pos.get("tp4_price"),
+            "tp5": pos.get("tp5_price"),
+            "tp6": pos.get("tp6_price"),
             "leverage": pos.get("leverage"),
             "timeframe": pos.get("timeframe"),
             "exchange": pos.get("exchange"),
@@ -438,7 +352,7 @@ def api_export():
 
     if tab == "positions":
         positions = redis_get("positions") or {}
-        data = [p for _, p in _position_items(positions)]
+        data = list(positions.values())
     else:
         history = redis_get("trade_history") or []
         data = _filter_history(history, period, direction)
@@ -792,7 +706,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
         <!-- P&L Chart -->
         <div class="chart-card">
-          <div class="chart-title">📉 Σ доходностей сделок по дням (не portfolio equity)</div>
+          <div class="chart-title">📉 Кумулятивный P&L % по дням</div>
           <div class="chart-wrap"><canvas id="pnlChart"></canvas></div>
         </div>
 
@@ -807,7 +721,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <div class="tab-content" id="tab-positions">
         <div class="filters">
           <span class="filter-label">Direction</span>
-          <div class="filter-group" id="pos-dir-btns">
+          <div class="filter-group">
             <button class="filter-btn" data-val="LONG" onclick="setPosDir('LONG',this)">LONG</button>
             <button class="filter-btn" data-val="SHORT" onclick="setPosDir('SHORT',this)">SHORT</button>
             <button class="filter-btn active" data-val="BOTH" onclick="setPosDir('BOTH',this)">BOTH</button>
@@ -904,7 +818,7 @@ function setActive(groupId, val) {
 }
 function setPeriod(val) { state.period = val; setActive('period-btns', val); loadStats(); }
 function setDirection(val) { state.direction = val; setActive('dir-btns', val); loadStats(); }
-function setPosDir(val, btn) { state.posDir = val; setActive('pos-dir-btns', val); renderPositions(); }
+function setPosDir(val, btn) { state.posDir = val; setActive('hist-dir-btns', val); renderPositions(); }
 function setHistPeriod(val) { state.histPeriod = val; state.histPage = 1; setActive('hist-period-btns', val); loadHistory(); }
 function setHistDir(val) { state.histDir = val; state.histPage = 1; setActive('hist-dir-btns', val); loadHistory(); }
 
@@ -928,19 +842,19 @@ function renderKPIs(data) {
 
   document.getElementById('kpi-grid').innerHTML = `
     <div class="kpi-card">
-      <div class="kpi-label">Σ Trade P&L %</div>
+      <div class="kpi-label">Total P&L %</div>
       <div class="kpi-value ${pnlClass}">${fmtPnl(s.total_pnl)}</div>
-      <div class="kpi-sub">Avg: ${fmtPnl(s.avg_pnl)} · n=${s.pnl_scored}/${s.total}</div>
+      <div class="kpi-sub">Avg: ${fmtPnl(s.avg_pnl)}</div>
     </div>
     <div class="kpi-card">
       <div class="kpi-label">Win Rate</div>
       <div class="kpi-value ${wrClass}">${s.win_rate}%</div>
-      <div class="kpi-sub">Net+: ${s.profitable} · Net−: ${s.net_losses} · BE: ${s.breakeven}</div>
+      <div class="kpi-sub">${s.profitable} из ${s.total} сделок</div>
     </div>
     <div class="kpi-card">
       <div class="kpi-label">Total Trades</div>
       <div class="kpi-value accent">${s.total}</div>
-      <div class="kpi-sub">Full TP: ${s.wins} Partial: ${s.partials} Status Loss: ${s.losses}</div>
+      <div class="kpi-sub">Win: ${s.wins} Partial: ${s.partials} Loss: ${s.losses}</div>
     </div>
     <div class="kpi-card">
       <div class="kpi-label">Открытые</div>
@@ -953,7 +867,7 @@ function renderKPIs(data) {
       <div class="kpi-sub">W:${s.today_wins} L:${s.today_losses} T:${s.today_total}</div>
     </div>
     <div class="kpi-card">
-      <div class="kpi-label">SL events today</div>
+      <div class="kpi-label">SL / BE Today</div>
       <div class="kpi-value red">${s.today_sl}</div>
       <div class="kpi-sub">BE-стоп сегодня: ${s.today_be}</div>
     </div>
@@ -962,23 +876,19 @@ function renderKPIs(data) {
   // TP badges
   const tpRow = document.getElementById('tp-row');
   let badges = '';
-  for (let i = 1; i <= 4; i++) {
+  for (let i = 1; i <= 6; i++) {
     const cnt = s.tp_counts[i] || 0;
-    badges += `<span class="tp-badge tp${i}">✅ Reached TP${i}: ${cnt}</span>`;
+    if (cnt > 0 || i <= 4) badges += `<span class="tp-badge tp${i}">✅ TP${i}: ${cnt}</span>`;
   }
   badges += `<span class="tp-badge sl">❌ SL: ${s.sl_count}</span>`;
   badges += `<span class="tp-badge be">🔒 BE: ${s.be_count}</span>`;
   // Today TP
   let todayTpStr = '';
-  for (let i = 1; i <= 4; i++) {
+  for (let i = 1; i <= 6; i++) {
     const cnt = (s.today_tp || {})[i] || 0;
     if (cnt > 0) todayTpStr += ` TP${i}:${cnt}`;
   }
   if (todayTpStr) badges += `<span class="tp-badge tp1" style="opacity:0.7; font-size:11px;">Today${todayTpStr}</span>`;
-  const q = s.quality || {};
-  if ((q.pnl_missing || 0) + (q.negative_partials || 0) + (q.positive_losses || 0) + (q.legacy_tp_above_4 || 0) + (q.tp_summary_disagreements || 0) > 0) {
-    badges += `<span class="tp-badge be">⚠ Data: missing P&L ${q.pnl_missing||0}, partial≤0 ${q.negative_partials||0}, loss&gt;0 ${q.positive_losses||0}, TP mismatch ${q.tp_summary_disagreements||0}, legacy TP5+ ${q.legacy_tp_above_4||0}</span>`;
-  }
   tpRow.innerHTML = badges;
 }
 
@@ -992,11 +902,11 @@ function renderBreakdown(rows) {
     html += `
       <div class="breakdown-card">
         <div class="breakdown-title ${l.cls}">${l.icon} ${r.label}</div>
-        <div class="brow"><span class="brow-label">Σ Trade P&L %</span><span class="brow-val ${pnlClass}">${fmtPnl(r.total_pnl)}</span></div>
+        <div class="brow"><span class="brow-label">Total P&L %</span><span class="brow-val ${pnlClass}">${fmtPnl(r.total_pnl)}</span></div>
         <div class="brow"><span class="brow-label">Today P&L %</span><span class="brow-val ${todayClass}">${fmtPnl(r.today_pnl)}</span></div>
         <div class="brow"><span class="brow-label">Win Rate</span><span class="brow-val">${r.win_rate}%</span></div>
-        <div class="brow"><span class="brow-label">Net+ / Net− / BE</span><span class="brow-val">${r.profitable} / ${r.net_losses} / ${r.breakeven}</span></div>
-        <div class="brow"><span class="brow-label">Открытые</span><span class="brow-val cyan">${r.open_count}</span></div>
+        <div class="brow"><span class="brow-label">W / L / BE</span><span class="brow-val">${r.wins+r.partials} / ${r.losses} / ${r.be_count}</span></div>
+        <div class="brow"><span class="brow-label">Открытые</span><span class="brow-val cyan">${r.label === 'LONG' ? '--' : r.label === 'SHORT' ? '--' : '--'}</span></div>
         <div class="brow"><span class="brow-label">Всего сделок</span><span class="brow-val">${r.total}</span></div>
         <div class="brow"><span class="brow-label">TP Today</span><span class="brow-val green">${r.today_wins}</span></div>
         <div class="brow"><span class="brow-label">SL Today</span><span class="brow-val red">${r.today_sl}</span></div>
@@ -1022,7 +932,7 @@ function renderChart(dailyPnl) {
       datasets: [
         {
           type: 'bar',
-          label: 'Σ trade P&L % день',
+          label: 'P&L % день',
           data: barData,
           backgroundColor: colors,
           borderColor: colors.map(c => c.replace('0.5', '0.9')),
@@ -1031,7 +941,7 @@ function renderChart(dailyPnl) {
         },
         {
           type: 'line',
-          label: 'Кум. Σ trade P&L %',
+          label: 'Кум. P&L %',
           data: cumData.map(d => d.y),
           borderColor: '#6366f1',
           backgroundColor: 'rgba(99,102,241,0.1)',
@@ -1096,7 +1006,7 @@ function renderPositions() {
   let html = `<table>
     <thead><tr>
       <th>Пара</th><th>Направление</th><th>Вход</th><th>SL</th>
-      <th>TP1</th><th>TP2</th><th>TP3</th><th>TP4</th>
+      <th>TP1</th><th>TP2</th><th>TP3</th><th>TP4</th><th>TP5</th><th>TP6</th>
       <th>Сигнал</th><th>Режим входа</th><th>BE/Trail</th>
       <th>ТФ</th><th>Биржа</th><th>Открыта</th>
     </tr></thead><tbody>`;
@@ -1122,6 +1032,8 @@ function renderPositions() {
       <td class="mono green">${fmt(p.tp2)}</td>
       <td class="mono green">${fmt(p.tp3)}</td>
       <td class="mono green">${fmt(p.tp4)}</td>
+      <td class="mono green">${fmt(p.tp5)}</td>
+      <td class="mono green">${fmt(p.tp6)}</td>
       <td>${sigTag}</td>
       <td style="color:var(--cyan)">${modeStr || '—'}</td>
       <td>${beTrail}</td>

@@ -192,8 +192,8 @@ PAIR_SETTINGS: dict = _parse_pair_settings(os.environ.get("PAIR_SETTINGS_JSON", 
 
 # TP_CLOSE_PCT: распределение частичных закрытий по уровням TP
 # ✅ EDGE-FIX: 4 TP, «прибыль течёт» — только 45% выходит у входа (TP1+TP2),
-# 55% бежит до TP3/TP4 (3.5R/5R). Контракт содержит ровно четыре TP.
-TP_CLOSE_PCT = {1: 0.20, 2: 0.25, 3: 0.30, 4: 0.25}
+# 55% бежит до TP3/TP4 (3.5R/5R). TP5/TP6 отключены (0) → нет dust-ордеров (110422).
+TP_CLOSE_PCT = {1: 0.20, 2: 0.25, 3: 0.30, 4: 0.25, 5: 0.0, 6: 0.0}
 
 
 def calc_trade_pnl(pos: dict, sl_exit_price: float | None = None) -> dict:
@@ -232,7 +232,7 @@ def calc_trade_pnl(pos: dict, sl_exit_price: float | None = None) -> dict:
     closed_pct   = 0.0   # доля позиции, закрытая на TP (0–1)
     tp_pnl_pct   = 0.0   # накопленный P&L от TP-закрытий (без плеча)
 
-    for n in range(1, 5):
+    for n in range(1, 7):
         if not pos.get(f"tp{n}_hit"):
             continue
         tp_price = float(pos.get(f"tp{n}_price") or 0)
@@ -259,8 +259,6 @@ def calc_trade_pnl(pos: dict, sl_exit_price: float | None = None) -> dict:
 
     total_no_lev = tp_pnl_pct + sl_pnl_pct
     total_with_lev = total_no_lev * lev
-    notional_usd = entry * total
-    pnl_usd = notional_usd * total_no_lev
 
     return {
         "pnl_pct":          round(total_with_lev * 100, 2),
@@ -271,9 +269,6 @@ def calc_trade_pnl(pos: dict, sl_exit_price: float | None = None) -> dict:
         "tps_hit":          tps_hit,
         "remaining_pct":    round(remaining_pct * 100, 1),
         "closed_on_tp_pct": round(closed_pct    * 100, 1),
-        "pnl_usd":          round(pnl_usd, 4),
-        "notional_usd":     round(notional_usd, 4),
-        "margin_usd":       round(notional_usd / lev, 4) if lev > 0 else None,
     }
 
 DATA_DIR = os.environ.get("DATA_DIR", "/tmp")
@@ -1023,7 +1018,7 @@ def bingx_place_tp(ticker: str, side: str, qty: float, trigger_price: float) -> 
 def place_tp_orders(ticker: str, side: str, opp_side: str, total_qty: float,
                     tp_prices: dict, exchange: str) -> dict:
     """
-    Выставляет переданные TP1–TP4 как ордера на бирже.
+    Выставляет TP1–TP6 как ордера на бирже.
     tp_prices: {1: price, 2: price, ...}
     Возвращает: {1: order_id, 2: order_id, ...}
 
@@ -1171,7 +1166,7 @@ def _trade_instance_id(key: str = "", trade_data: dict | None = None,
 def _highest_tp_hit(pos: dict | None) -> int:
     if not pos:
         return 0
-    hits = [n for n in range(1, 5) if pos.get(f"tp{n}_hit")]
+    hits = [n for n in range(1, 7) if pos.get(f"tp{n}_hit")]
     return max(hits, default=0)
 
 
@@ -1251,11 +1246,8 @@ def save_trade_to_history(payload: dict, trade_data: dict | None, result: str, t
         "sl_price": pos.get("sl_price", trade_data.get("sl_price")),
         "total_qty": pos.get("total_qty", trade_data.get("total_qty")),
         "remaining_qty": pos.get("remaining_qty", trade_data.get("remaining_qty")),
-        "leverage": pos.get("leverage", trade_data.get("leverage")),
-        "notional_usdt": pos.get("notional_usdt", trade_data.get("notional_usdt")),
-        "margin_usdt": pos.get("margin_usdt", trade_data.get("margin_usdt")),
         # highest_tp_hit = best TP reached during trade lifetime
-        # tp_num = the TP that closed the position (4 for full close, 0 for SL)
+        # tp_num = the TP that CLOSED the position (6 for full close, 0 for SL)
         "highest_tp_hit": max(tp_num, _highest_tp_hit(pos)),
         "entry_time": entry_time,
         "close_time": now,
@@ -1330,7 +1322,7 @@ def _build_report(trades: list, title: str, show_last: int = 5,
     avg_pnl = round(sum(pnl_values) / len(pnl_values), 2) if pnl_values else None
 
     # ── Разбивка по TP: считаем highest_tp_hit для всех закрытых сделок ─
-    # "wins" (TP4/remaining=0) и "partials" (SL после TP1-N) — обе считаются
+    # "wins" (TP6/remaining=0) и "partials" (SL после TP1-N) — обе считаются
     tp_counts: dict = {}      # {tp_num: count}
     tp_pnl_sums: dict = {}    # {tp_num: [tp_pnl_pct, ...]}  ← BUG #6 FIX: tp_pnl_pct не pnl_pct
     for r in wins + partials:
@@ -1693,6 +1685,8 @@ def handle_entry(payload: dict):
     tp2_price = parse_price(text, "TP2:", "✅ TP2:") or _to_float(payload.get("tp2"))
     tp3_price = parse_price(text, "TP3:", "✅ TP3:") or _to_float(payload.get("tp3"))
     tp4_price = parse_price(text, "TP4:", "✅ TP4:") or _to_float(payload.get("tp4"))
+    tp5_price = parse_price(text, "TP5:", "✅ TP5:") or _to_float(payload.get("tp5"))
+    tp6_price = parse_price(text, "TP6:", "✅ TP6:") or _to_float(payload.get("tp6"))
 
     # ── Цена входа: из текста, затем из JSON-поля entry_price ────────
     # Pine Script sometimes sends NaN in entry_price JSON field — text has the real value
@@ -1713,6 +1707,10 @@ def handle_entry(payload: dict):
         tp3_price = parse_price(text, "TP3:", "TP 3:", "✅ TP3:")
     if tp4_price is None and text:
         tp4_price = parse_price(text, "TP4:", "TP 4:", "✅ TP4:")
+    if tp5_price is None and text:
+        tp5_price = parse_price(text, "TP5:", "TP 5:", "✅ TP5:")
+    if tp6_price is None and text:
+        tp6_price = parse_price(text, "TP6:", "TP 6:", "✅ TP6:")
 
     # ── Диагностика — видно что распарсилось ──────────────────────────
     # ✅ IMPROVEMENT #1: SL fallback when Pine Script sends null
@@ -1729,7 +1727,7 @@ def handle_entry(payload: dict):
 
     write_log(f"PARSED | {ticker} entry={price} sl={sl_price} atr_pct={atr_pct_val} "
               f"tp1={tp1_price} tp2={tp2_price} tp3={tp3_price} "
-              f"tp4={tp4_price}")
+              f"tp4={tp4_price} tp5={tp5_price} tp6={tp6_price}")
 
     qty = 1.0
     sl_order_id = ""
@@ -1777,7 +1775,7 @@ def handle_entry(payload: dict):
         # ── Выставляем TP-ордера на биржу ──────────────────────────────────────
         _tp_map = {n: p for n, p in [
             (1, tp1_price), (2, tp2_price), (3, tp3_price),
-            (4, tp4_price),
+            (4, tp4_price), (5, tp5_price), (6, tp6_price),
         ] if p}
         if _tp_map:
             time.sleep(0.3)
@@ -1843,9 +1841,6 @@ def handle_entry(payload: dict):
         "entry_price": price,
         "total_qty": qty,
         "remaining_qty": qty,
-        "leverage": leverage,
-        "notional_usdt": round(float(price or 0) * float(qty or 0), 8),
-        "margin_usdt": round((float(price or 0) * float(qty or 0)) / leverage, 8) if leverage > 0 else None,
         "sl_price": sl_price,
     }
     dedup_entry(ticker, direction, current_key=key)
@@ -1867,14 +1862,14 @@ def handle_entry(payload: dict):
             "total_qty": qty,
             "remaining_qty": qty,
             "leverage": leverage,
-            "notional_usdt": round(float(price or 0) * float(qty or 0), 8),
-            "margin_usdt": round((float(price or 0) * float(qty or 0)) / leverage, 8) if leverage > 0 else None,
             "sl_price": sl_price,
             "sl_order_id": sl_order_id,
             "tp1_price": tp1_price,
             "tp2_price": tp2_price,
             "tp3_price": tp3_price,
             "tp4_price": tp4_price,
+            "tp5_price": tp5_price,
+            "tp6_price": tp6_price,
             "tp_order_ids": tp_order_ids,
             "use_exchange_tps": use_exchange_tps,
             "trade_id": trade_id,
@@ -1895,9 +1890,6 @@ def handle_tp_hit(payload: dict):
     ticker = payload.get("ticker", "").upper().replace(".P", "")
     direction = (payload.get("direction") or "").upper()
     tp_num = int(payload.get("tp_num") or 0)
-    if tp_num not in TP_CLOSE_PCT:
-        write_log(f"TP_REJECT | {ticker} TP{tp_num} | valid levels are TP1..TP4")
-        return
     text = payload.get("text", "").strip()
     key = build_trade_key(payload)
     trade_key, trade = find_trade_entry(
@@ -1925,10 +1917,8 @@ def handle_tp_hit(payload: dict):
             _found_pos = False
             # Exit early — position logic below requires valid pos, Telegram msg sent after lock
         else:
-            # Price reaching TPn implies all lower ordered targets were crossed.
-            # Recover missing flags so webhook loss/reordering cannot corrupt P&L.
-            newly_hit = [n for n in range(1, tp_num + 1) if not pos.get(f"tp{n}_hit")]
-            if not newly_hit:
+            # Position exists — check if TP already hit
+            if pos.get(f"tp{tp_num}_hit"):
                 write_log(f"TP_DUPLICATE_SKIP | {ticker} TP{tp_num} | already applied")
                 return
 
@@ -1937,8 +1927,7 @@ def handle_tp_hit(payload: dict):
             total_qty = pos["total_qty"]
             remaining = pos["remaining_qty"]
             opp_side = pos["opp_side"]
-            close_share = sum(TP_CLOSE_PCT[n] for n in newly_hit)
-            close_qty = round(total_qty * close_share, 8)
+            close_qty = round(total_qty * TP_CLOSE_PCT.get(tp_num, 0.0), 8)
             close_qty = min(close_qty, remaining)
             min_q = ex_min_qty(ticker, exchange) if exchange != "none" else 0.0
 
@@ -1958,8 +1947,7 @@ def handle_tp_hit(payload: dict):
                 close_qty = 0.0
 
             new_remaining = max(0.0, remaining - close_qty)
-            for n in newly_hit:
-                pos[f"tp{n}_hit"] = True
+            pos[f"tp{tp_num}_hit"] = True
             pos["remaining_qty"] = new_remaining
             highest_tp = _highest_tp_hit(pos)
 
@@ -1967,7 +1955,7 @@ def handle_tp_hit(payload: dict):
                 pos["trail_active"] = True
                 pos["trail_sl"]     = pos.get("sl_price")
 
-            if new_remaining <= min_q or tp_num >= 4:
+            if new_remaining <= min_q or tp_num >= 6:
                 if exchange != "none":
                     cancel_own_orders(pos)  # 🔒 только свои ордера, не ручные юзера
                 positions.pop(pkey, None)
@@ -1990,7 +1978,9 @@ def handle_tp_hit(payload: dict):
             trail_active=pos_snapshot.get("trail_active", False),
         )
     if final_close:
-        # Position fully closed at TP4 (or remaining ≤ min_qty).
+        # Position fully closed at TP6 (or remaining ≤ min_qty)
+        # BUG #9 FIX: pos_snapshot уже содержит tp{tp_num}_hit=True (установлено на строке 1843)
+        # но дополнительно гарантируем что текущий TP флаг присутствует в snapshot
         if not pos_snapshot.get(f"tp{tp_num}_hit"):
             pos_snapshot[f"tp{tp_num}_hit"] = True
         pnl = calc_trade_pnl(pos_snapshot, None)
