@@ -102,6 +102,8 @@ BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET", "")
 BINGX_API_KEY    = os.environ.get("BINGX_API_KEY",    "")
 BINGX_API_SECRET = os.environ.get("BINGX_API_SECRET", "")
 BINGX_DEMO       = os.environ.get("BINGX_DEMO", "false").lower() == "true"
+RENDER_SECRET    = (os.environ.get("RENDER_SECRET", "").strip()
+                    or os.environ.get("DASHBOARD_SECRET", "").strip())
 
 BYBIT_AVAILABLE = BYBIT_LIB and bool(BYBIT_API_KEY) and bool(BYBIT_API_SECRET)
 BINGX_AVAILABLE = bool(BINGX_API_KEY) and bool(BINGX_API_SECRET)
@@ -397,8 +399,12 @@ _startup_warnings()
 # БЕЗОПАСНОСТЬ
 # ══════════════════════════════════════════════════════════════════════════════
 def _http_auth(req) -> bool:
-    """Авторизация отключена — все эндпоинты открыты."""
-    return True
+    """Protect operational JSON endpoints; /health remains public."""
+    if not RENDER_SECRET:
+        return False
+    supplied = (req.args.get("secret", "").strip()
+                or req.headers.get("X-Render-Secret", "").strip())
+    return _hmac.compare_digest(supplied, RENDER_SECRET)
 
 
 _rate_store: dict[str, list[float]] = {}
@@ -1291,6 +1297,17 @@ def save_trade_to_history(payload: dict, trade_data: dict | None, result: str, t
         "is_strong": bool(
             payload.get("is_strong", trade_data.get("is_strong", pos.get("is_strong", False)))
         ),
+        "entry_mode": (
+            trade_data.get("entry_mode") or pos.get("entry_mode") or payload.get("entry_mode") or ""
+        ),
+        "score": trade_data.get("score", pos.get("score", payload.get("score"))),
+        "confirmations": trade_data.get(
+            "confirmations", pos.get("confirmations", payload.get("confirmations"))
+        ),
+        "atr_pct": trade_data.get("atr_pct", pos.get("atr_pct", payload.get("atr_pct"))),
+        "amd_phase": (
+            trade_data.get("amd_phase") or pos.get("amd_phase") or payload.get("amd_phase") or ""
+        ),
         "entry_message_id": trade_data.get("message_id") or pos.get("message_id"),
         "signal_message_id": trade_data.get("signal_message_id") or pos.get("signal_message_id"),
         "entry_price": trade_data.get("entry_price") or pos.get("entry_price"),
@@ -1889,6 +1906,11 @@ def handle_entry(payload: dict):
         "trade_key": key,
         "instance_id": instance_id,
         "is_strong": payload.get("is_strong", False),
+        "entry_mode": str(payload.get("entry_mode") or ""),
+        "score": payload.get("score"),
+        "confirmations": payload.get("confirmations"),
+        "atr_pct": payload.get("atr_pct"),
+        "amd_phase": str(payload.get("amd_phase") or ""),
         "created_at": created_at,
         "entry_price": price,
         "total_qty": qty,
@@ -1935,6 +1957,11 @@ def handle_entry(payload: dict):
             "instance_id": instance_id,
             "timeframe": timeframe,
             "is_strong": payload.get("is_strong", False),
+            "entry_mode": str(payload.get("entry_mode") or ""),
+            "score": payload.get("score"),
+            "confirmations": payload.get("confirmations"),
+            "atr_pct": payload.get("atr_pct"),
+            "amd_phase": str(payload.get("amd_phase") or ""),
             "message_id": trade_message_id,
             "signal_message_id": source_msg_id,
             "created_at": created_at,

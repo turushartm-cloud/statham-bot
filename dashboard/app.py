@@ -313,6 +313,7 @@ def _build_breakdown(history: list, positions=None) -> list:
     return rows
 
 # ── API Endpoints ──────────────────────────────────────────────────────────────
+@app.route("/stats")
 @app.route("/api/stats")
 @require_secret
 def api_stats():
