@@ -106,7 +106,8 @@ def _period_cutoff(period: str) -> float:
     }
     return mapping.get(period, 0)
 
-def _filter_history(history: list, period: str, direction: str, strategy_version: str = "") -> list:
+def _filter_history(history: list, period: str, direction: str,
+                    strategy_version: str = "", entry_mode: str = "") -> list:
     cutoff = _period_cutoff(period)
     result = []
     for r in history if isinstance(history, list) else []:
@@ -124,6 +125,8 @@ def _filter_history(history: list, period: str, direction: str, strategy_version
         if direction == "SHORT" and dr != "SELL":
             continue
         if strategy_version and str(r.get("strategy_version") or "legacy") != strategy_version:
+            continue
+        if entry_mode and str(r.get("entry_mode") or "").upper() != entry_mode.upper():
             continue
         result.append(r)
     return result
@@ -255,9 +258,15 @@ def _calc_stats(trades: list) -> dict:
     ]
     duplicate_terminal_events = len(terminal_ids) - len(set(terminal_ids))
     version_counts = {}
+    entry_mode_counts = {}
+    amd_phase_counts = {}
     for r in trades:
         version = str(r.get("strategy_version") or "legacy")
         version_counts[version] = version_counts.get(version, 0) + 1
+        mode = str(r.get("entry_mode") or "unknown")
+        entry_mode_counts[mode] = entry_mode_counts.get(mode, 0) + 1
+        phase = str(r.get("amd_phase") or "unknown")
+        amd_phase_counts[phase] = amd_phase_counts.get(phase, 0) + 1
     quality = {
         "pnl_known": pnl_scored,
         "pnl_missing": len(trades) - pnl_scored,
@@ -267,6 +276,8 @@ def _calc_stats(trades: list) -> dict:
         "tp_summary_disagreements": tp_summary_disagreements,
         "duplicate_terminal_events": duplicate_terminal_events,
         "strategy_versions": version_counts,
+        "entry_modes": entry_mode_counts,
+        "amd_phases": amd_phase_counts,
     }
 
     return {
@@ -320,9 +331,10 @@ def api_stats():
     period    = request.args.get("period", "all")
     direction = request.args.get("direction", "BOTH").upper()
     strategy_version = request.args.get("strategy_version", "").strip()
+    entry_mode = request.args.get("entry_mode", "").strip()
 
     history = redis_get("trade_history") or []
-    filtered = _filter_history(history, period, direction, strategy_version)
+    filtered = _filter_history(history, period, direction, strategy_version, entry_mode)
     stats = _calc_stats(filtered)
     positions = redis_get("positions") or {}
     position_items = _position_items(positions)
@@ -337,6 +349,7 @@ def api_stats():
         "open_shorts": open_shorts,
         "open_total": len(position_items),
         "strategy_version_filter": strategy_version or None,
+        "entry_mode_filter": entry_mode or None,
     })
 
 @app.route("/api/positions")
@@ -379,6 +392,9 @@ def api_positions():
             "fib_level": pos.get("fib_level"),
             "wyckoff_phase": pos.get("wyckoff_phase"),
             "amd_phase": pos.get("amd_phase"),
+            "score": pos.get("score"),
+            "confirmations": pos.get("confirmations"),
+            "atr_pct": pos.get("atr_pct"),
             "tbs": pos.get("tbs"),
             "smc": pos.get("smc"),
             "ict": pos.get("ict"),
@@ -396,9 +412,10 @@ def api_history():
     page      = int(request.args.get("page", 1))
     per_page  = int(request.args.get("per_page", 50))
     strategy_version = request.args.get("strategy_version", "").strip()
+    entry_mode = request.args.get("entry_mode", "").strip()
 
     history = redis_get("trade_history") or []
-    filtered = _filter_history(history, period, direction, strategy_version)
+    filtered = _filter_history(history, period, direction, strategy_version, entry_mode)
     # Sort newest first
     filtered.sort(key=lambda r: r.get("close_time", 0), reverse=True)
 
@@ -444,6 +461,9 @@ def api_history():
             "fib_level": r.get("fib_level"),
             "wyckoff_phase": r.get("wyckoff_phase"),
             "amd_phase": r.get("amd_phase"),
+            "score": r.get("score"),
+            "confirmations": r.get("confirmations"),
+            "atr_pct": r.get("atr_pct"),
             "tbs": r.get("tbs"),
             "smc": r.get("smc"),
             "ict": r.get("ict"),
@@ -1122,7 +1142,7 @@ function renderPositions() {
     <thead><tr>
       <th>Пара</th><th>Направление</th><th>Вход</th><th>SL</th>
       <th>TP1</th><th>TP2</th><th>TP3</th><th>TP4</th>
-      <th>Сигнал</th><th>Режим входа</th><th>BE/Trail</th>
+      <th>Сигнал</th><th>Режим входа</th><th>Score / ATR</th><th>BE/Trail</th>
       <th>ТФ</th><th>Биржа</th><th>Открыта</th>
     </tr></thead><tbody>`;
 
@@ -1132,7 +1152,11 @@ function renderPositions() {
     const sigTag = p.is_strong
       ? '<span class="tag tag-strong">STRONG</span>'
       : '<span class="tag tag-normal">NORMAL</span>';
-    let modeStr = p.entry_mode || p.strategy || p.smc ? ['SMC', p.wyckoff_phase ? 'Wyckoff' : '', p.ict ? 'ICT' : '', p.amd_phase ? 'AMD' : ''].filter(Boolean).join('+') : (p.entry_mode || '—');
+    const modeParts = [p.entry_mode, p.wyckoff_phase ? 'Wyckoff' : '', p.ict ? 'ICT' : '', p.amd_phase ? `AMD:${p.amd_phase}` : ''].filter(Boolean);
+    const modeStr = modeParts.length ? modeParts.join(' + ') : '—';
+    const analyticsStr = p.score == null
+      ? '—'
+      : `${Number(p.score).toFixed(1)} / C${p.confirmations ?? '—'} / ATR ${p.atr_pct ?? '—'}%`;
     let beTrail = '';
     if (p.trail_active) beTrail = '<span class="tag tag-trail">TRAIL</span>';
     else if (p.be_active) beTrail = '<span class="tag tag-be">BE</span>';
@@ -1149,6 +1173,7 @@ function renderPositions() {
       <td class="mono green">${fmt(p.tp4)}</td>
       <td>${sigTag}</td>
       <td style="color:var(--cyan)">${modeStr || '—'}</td>
+      <td style="color:var(--muted);font-size:11px">${analyticsStr}</td>
       <td>${beTrail}</td>
       <td style="color:var(--muted)">${p.timeframe || '—'}</td>
       <td style="color:var(--muted)">${p.exchange || '—'}</td>
@@ -1187,7 +1212,7 @@ function renderHistory(rows, total) {
     <thead><tr>
       <th>Дата закрытия</th><th>Пара</th><th>Направление</th><th>Результат</th>
       <th>Вход</th><th>SL</th><th>TP#</th><th>P&L %</th><th>TP P&L</th>
-      <th>Длит.</th><th>Режим</th><th>Стиль</th><th>ТФ</th><th>Паттерн</th>
+      <th>Длит.</th><th>Режим</th><th>Score / ATR</th><th>Стиль</th><th>ТФ</th><th>Паттерн</th>
       <th>Плечо</th><th>Биржа</th><th>Детали</th>
     </tr></thead><tbody>`;
 
@@ -1205,6 +1230,9 @@ function renderHistory(rows, total) {
     const tpPnlStr = r.tp_pnl_pct != null && r.tp_pnl_pct !== 0 ? (r.tp_pnl_pct > 0 ? '+' : '') + r.tp_pnl_pct.toFixed(2) + '%' : '—';
     const tpNum = r.highest_tp_hit ? `TP${r.highest_tp_hit}` : (r.result === 'loss' ? 'SL' : '—');
     const dur = fmtDuration(r.duration_sec || 0);
+    const analyticsStr = r.score == null
+      ? '—'
+      : `${Number(r.score).toFixed(1)} / C${r.confirmations ?? '—'} / ATR ${r.atr_pct ?? '—'}%`;
 
     // Detail tags
     let details = '';
@@ -1228,6 +1256,7 @@ function renderHistory(rows, total) {
       <td class="pnl-pos">${tpPnlStr}</td>
       <td class="dur">${dur}</td>
       <td style="color:var(--cyan);font-size:11px">${r.entry_mode || '—'}</td>
+      <td style="color:var(--muted);font-size:11px">${analyticsStr}</td>
       <td style="color:var(--muted);font-size:11px">${r.style || '—'}</td>
       <td style="color:var(--muted);font-size:11px">${r.timeframe || '—'}</td>
       <td style="color:var(--muted);font-size:11px">${r.pattern || '—'}</td>

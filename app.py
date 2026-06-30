@@ -24,7 +24,8 @@ Statham Trading Bot — RENDER (Unified v2.0)
   TG_SIGNALS_TOPIC    — ID ветки сигналов
   TG_SESSIONS_TOPIC   — ID ветки сессий/F&G
   RENDER_URL          — свой URL на Render (для keepalive)
-  ADMIN_IDS           — через запятую: 123456,789012
+  ADMIN_USER_IDS      — разрешённые Telegram user ID через запятую
+  ADMIN_IDS           — legacy alias для ADMIN_USER_IDS
 
   # ── Bybit ────────────────────────────────────────────────────────
   BYBIT_API_KEY       — ключ Bybit
@@ -108,8 +109,12 @@ RENDER_SECRET    = (os.environ.get("RENDER_SECRET", "").strip()
 BYBIT_AVAILABLE = BYBIT_LIB and bool(BYBIT_API_KEY) and bool(BYBIT_API_SECRET)
 BINGX_AVAILABLE = bool(BINGX_API_KEY) and bool(BINGX_API_SECRET)
 
+_ADMIN_IDS_RAW = ",".join(filter(None, [
+    os.environ.get("ADMIN_USER_IDS", "").strip(),
+    os.environ.get("ADMIN_IDS", "").strip(),
+]))
 ADMIN_IDS = set(
-    int(x.strip()) for x in os.environ.get("ADMIN_IDS", "").split(",")
+    int(x.strip()) for x in _ADMIN_IDS_RAW.split(",")
     if x.strip().lstrip("-").isdigit()
 )
 
@@ -1657,7 +1662,10 @@ def cleanup_old_trades() -> int:
 
         removed = []
         for k, v in list(trades.items()):
-            created = v.get("created_at", 0)
+            created = int(v.get("created_at") or 0)
+            # Never age out a trade that still owns a tracked position.
+            if k in pos_keys_set:
+                continue
             if created < cutoff_old:
                 removed.append(k)
                 continue
@@ -2707,7 +2715,79 @@ def _scheduler():
 # POSITION MANAGER (Trailing Stop)
 # ══════════════════════════════════════════════════════════════════════════════
 _last_exchange_sync = 0
-_EXCHANGE_SYNC_INTERVAL = 600  # 10 минут
+_EXCHANGE_SYNC_INTERVAL = 3600  # один раз в час; /sync обходит interval вручную
+
+
+def _recover_missing_trade_records() -> int:
+    """Restore a minimal trade record for every tracked position.
+
+    Position is the execution state used for TP/SL handling.  A missing trade
+    record breaks reply threading and terminal history linkage, so parity is
+    repaired without changing exchange orders or position size.
+    """
+    positions = dict(load_positions())
+    trades = dict(load_trades())
+    recovered = 0
+    now = int(time.time())
+
+    for pkey, pos in positions.items():
+        ticker = str(pos.get("symbol") or pos.get("ticker") or "").upper().replace(".P", "")
+        direction = str(pos.get("direction") or "").upper()
+        trade_id = str(pos.get("trade_id") or "").strip()
+        trade_key = str(pos.get("trade_key") or trade_id or "").strip()
+        already_present = bool(trade_key and trade_key in trades) or any(
+            str(t.get("trade_id") or "") == trade_id and trade_id
+            or (str(t.get("ticker") or "").upper().replace(".P", "") == ticker
+                and str(t.get("direction") or "").upper() == direction)
+            for t in trades.values() if isinstance(t, dict)
+        )
+        if already_present or not ticker or direction not in ("BUY", "SELL"):
+            continue
+
+        key = trade_key or f"recovered:{pkey}:{int(pos.get('created_at') or now)}"
+        record = {
+            "strategy_version": str(pos.get("strategy_version") or "legacy"),
+            "schema_version": int(pos.get("schema_version") or 1),
+            "tp_contract": str(pos.get("tp_contract") or "legacy"),
+            "event": "entry",
+            "ticker": ticker,
+            "direction": direction,
+            "timeframe": pos.get("timeframe", ""),
+            "exchange": pos.get("exchange", "none"),
+            "trade_mode": pos.get("trade_mode", "telegram_only"),
+            "trade_id": trade_id,
+            "trade_key": key,
+            "instance_id": str(pos.get("instance_id") or trade_id or key),
+            "message_id": pos.get("message_id"),
+            "signal_message_id": pos.get("signal_message_id"),
+            "created_at": int(pos.get("created_at") or now),
+            "entry_price": pos.get("entry_price"),
+            "sl_price": pos.get("sl_price"),
+            "total_qty": pos.get("total_qty"),
+            "remaining_qty": pos.get("remaining_qty"),
+            "leverage": pos.get("leverage"),
+            "is_strong": bool(pos.get("is_strong", False)),
+            "entry_mode": pos.get("entry_mode", ""),
+            "score": pos.get("score"),
+            "confirmations": pos.get("confirmations"),
+            "atr_pct": pos.get("atr_pct"),
+            "amd_phase": pos.get("amd_phase", ""),
+            "be_active": bool(pos.get("be_active", False)),
+            "trail_active": bool(pos.get("trail_active", False)),
+            "state_recovered": True,
+            "recovered_at": now,
+        }
+        trades[key] = record
+        if pos.get("trade_key") != key:
+            pos["trade_key"] = key
+            positions[pkey] = pos
+        recovered += 1
+
+    if recovered:
+        save_trades(trades)
+        save_positions(positions)
+        write_log(f"STATE_RECOVERY | restored {recovered} missing trade records")
+    return recovered
 
 
 def _sync_exchange_positions():
@@ -2734,13 +2814,15 @@ def _sync_exchange_positions():
     if bybit_tracked and BYBIT_AVAILABLE:
         try:
             resp = bybit().get_positions(category="linear", settleCoin="USDT")
-            live_symbols = {
-                p["symbol"] for p in resp.get("result", {}).get("list", [])
-                if float(p.get("size", 0)) > 0
+            live_positions = {
+                (p["symbol"], "BUY" if str(p.get("side", "")).lower() == "buy" else "SELL")
+                for p in resp.get("result", {}).get("list", [])
+                if float(p.get("size", 0)) > 0 and p.get("side") in ("Buy", "Sell")
             }
             phantoms = [
                 pkey for pkey, pos in bybit_tracked.items()
-                if pos.get("symbol") and pos["symbol"] not in live_symbols
+                if pos.get("symbol") and
+                (pos["symbol"], str(pos.get("direction") or "").upper()) not in live_positions
                 and pos.get("exchange") != "none"
             ]
             if phantoms:
@@ -2766,14 +2848,18 @@ def _sync_exchange_positions():
         try:
             data = _bingx_req("GET", "/openApi/swap/v2/user/positions", {})
             live_bingx = {
-                p.get("symbol", "").replace("-", "")
+                (p.get("symbol", "").replace("-", ""),
+                 "BUY" if str(p.get("positionSide") or "").upper() == "LONG"
+                 else "SELL" if str(p.get("positionSide") or "").upper() == "SHORT"
+                 else "BUY" if float(p.get("positionAmt", 0) or 0) > 0 else "SELL")
                 for p in (data.get("data") or [])
                 if float(p.get("positionAmt", 0) or 0) != 0
             }
             phantoms_bx = [
                 pkey for pkey, pos in bingx_tracked.items()
                 if pos.get("symbol") and
-                _bingx_to_symbol(pos["symbol"]).replace("-", "") not in live_bingx
+                (_bingx_to_symbol(pos["symbol"]).replace("-", ""),
+                 str(pos.get("direction") or "").upper()) not in live_bingx
             ]
             if phantoms_bx:
                 with _pos_lock:
@@ -2785,12 +2871,19 @@ def _sync_exchange_positions():
         except Exception as e:
             write_log(f"SYNC_BINGX_ERR | {e}")
 
+    recovered = _recover_missing_trade_records()
+    removed_orphans = cleanup_old_trades()
+    write_log(
+        f"SYNC_STATE | positions={len(load_positions())} trades={len(load_trades())} "
+        f"recovered={recovered} removed_orphans={removed_orphans}"
+    )
+
 
 def _position_manager():
     write_log("POSITION_MANAGER | start")
     while True:
         try:
-            # Периодическая сверка с биржами (каждые 10 минут)
+            # Direction-aware сверка с биржами один раз в час.
             _sync_exchange_positions()
 
             with _pos_lock:
@@ -3015,6 +3108,8 @@ if bot:
 
     @bot.message_handler(commands=["daily_report"])
     def cmd_daily(m):
+        if not is_admin_user(m.from_user.id):
+            _reply(m, "⛔ Нет доступа."); return
         today = _msk().strftime("%Y-%m-%d")
         ts    = [r for r in load_history() if r.get("date_msk") == today]
         if not ts:
@@ -3025,6 +3120,8 @@ if bot:
 
     @bot.message_handler(commands=["weekly_report"])
     def cmd_weekly(m):
+        if not is_admin_user(m.from_user.id):
+            _reply(m, "⛔ Нет доступа."); return
         msk  = _msk()
         wk   = f"{msk.year}-W{msk.isocalendar()[1]:02d}"
         # Дата начала/конца недели (пн–вс)
@@ -3045,6 +3142,8 @@ if bot:
 
     @bot.message_handler(commands=["monthly_report"])
     def cmd_monthly(m):
+        if not is_admin_user(m.from_user.id):
+            _reply(m, "⛔ Нет доступа."); return
         msk = _msk()
         mo  = f"{msk.year}-{msk.month:02d}"
         import calendar as _cal
@@ -3077,6 +3176,8 @@ if bot:
 
     @bot.message_handler(commands=["leaders"])
     def cmd_leaders(m):
+        if not is_admin_user(m.from_user.id):
+            _reply(m, "⛔ Нет доступа."); return
         by_ticker: dict = {}
         for r in load_history():
             tk = r.get("ticker", "?").replace(".P", "")
@@ -3298,16 +3399,22 @@ if bot:
 
     @bot.message_handler(commands=["fear_greed"])
     def cmd_fear_greed(m):
+        if not is_admin_user(m.from_user.id):
+            _reply(m, "⛔ Нет доступа."); return
         fg = _fetch_fg()
         if fg is None: _reply(m, "❌ Не удалось получить F&G."); return
         _reply(m, _build_fg_message(fg, "manual"))
 
     @bot.message_handler(commands=["sessions"])
     def cmd_sessions(m):
+        if not is_admin_user(m.from_user.id):
+            _reply(m, "⛔ Нет доступа."); return
         _reply(m, _sessions_status())
 
     @bot.message_handler(commands=["market"])
     def cmd_market(m):
+        if not is_admin_user(m.from_user.id):
+            _reply(m, "⛔ Нет доступа."); return
         fg = _fetch_fg()
         fg_line = ""
         if fg:
@@ -3512,12 +3619,15 @@ if bot:
         global _last_exchange_sync
         _last_exchange_sync = 0  # сброс → sync запустится немедленно
         before = len(load_positions())
+        trades_before = len(load_trades())
         _sync_exchange_positions()
         after = len(load_positions())
+        trades_after = len(load_trades())
         removed = before - after
         _reply(m, (
             f"🔄 <b>Синхронизация завершена</b>\n"
             f"Позиций до: {before} | После: {after}\n"
+            f"Trades до: {trades_before} | После: {trades_after}\n"
             f"Удалено призрачных: <b>{removed}</b>"
         ))
 

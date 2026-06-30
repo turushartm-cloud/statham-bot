@@ -22,6 +22,8 @@ services:
       # ── Render ────────────────────────────────────────────────────
       - key: RENDER_URL
         sync: false          # https://statham-bot-dpvt.onrender.com
+      - key: RENDER_SECRET
+        sync: false          # защита /trades /positions /history /stats
 
       # ── Bybit (РЕАЛЬНЫЕ ДЕНЬГИ) ───────────────────────────────────
       - key: BYBIT_API_KEY
@@ -50,8 +52,8 @@ services:
         value: "YBUSDT,ASTERUSDT,EDGEUSDT,STOUSDT,UNIUSDT,SIRENUSDT,FARTCOINUSDT,WLDUSDT,ZBTUSDT,BLESSUSDT"
 
       # ── Администраторы (Telegram user_id) ────────────────────────
-      - key: ADMIN_IDS
-        sync: false          # 7617558315
+      - key: ADMIN_USER_IDS
+        value: "7617558315"
 
       # ── Торговля — глобальные дефолты ────────────────────────────
       - key: DEFAULT_LEVERAGE

@@ -1,6 +1,7 @@
 import copy
 import importlib.util
 import pathlib
+import ast
 import unittest
 
 
@@ -125,6 +126,21 @@ class BotScenarioGate(unittest.TestCase):
         self.assertEqual(row["confirmations"], 4)
         self.assertEqual(row["atr_pct"], 1.25)
         self.assertEqual(row["amd_phase"], "ACCUMULATION")
+
+    def test_missing_trade_record_is_recovered_from_position(self):
+        self.seed(trade_id="recover-me")
+        self.trades.clear()
+        recovered = self.bot._recover_missing_trade_records()
+        self.assertEqual(recovered, 1)
+        self.assertIn("recover-me", self.trades)
+        self.assertTrue(self.trades["recover-me"]["state_recovered"])
+
+    def test_cleanup_preserves_old_trade_with_live_position(self):
+        self.seed(trade_id="old-live")
+        self.trades["old-live"]["created_at"] = 1
+        removed = self.bot.cleanup_old_trades()
+        self.assertEqual(removed, 0)
+        self.assertIn("old-live", self.trades)
 
     def test_tp1_then_sl_is_partial_but_not_implicit_be(self):
         payload = self.seed()
@@ -274,6 +290,39 @@ class StaticPineGate(unittest.TestCase):
             self.assertIn("if tbs_bull_new", source)
             self.assertIn("if tbs_bear_new", source)
 
+    def test_two_txt_has_no_out_of_scope_legacy_tp_draw(self):
+        source = (PINE_ROOT / "2.txt").read_text(encoding="utf-8")
+        reset_at = source.index("if barstate.islast and (na(active_sl) or not lines_active)")
+        execution_at = source.index("if not na(active_sl) and lines_active", reset_at)
+        between = source[reset_at:execution_at]
+        self.assertNotIn("tp5_line  := line.new", between)
+        self.assertNotIn("tp6_line  := line.new", between)
+
+
+class AdminAclGate(unittest.TestCase):
+    def test_every_telegram_command_has_admin_guard(self):
+        source = (ROOT / "app.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        unguarded = []
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            is_command = any(
+                isinstance(dec, ast.Call)
+                and isinstance(dec.func, ast.Attribute)
+                and dec.func.attr == "message_handler"
+                and any(kw.arg == "commands" for kw in dec.keywords)
+                for dec in node.decorator_list
+            )
+            if is_command and "is_admin_user" not in (ast.get_source_segment(source, node) or ""):
+                unguarded.append(node.name)
+        self.assertEqual(unguarded, [])
+
+    def test_admin_user_ids_env_is_supported(self):
+        source = (ROOT / "app.py").read_text(encoding="utf-8")
+        self.assertIn('os.environ.get("ADMIN_USER_IDS"', source)
+        self.assertIn("_EXCHANGE_SYNC_INTERVAL = 3600", source)
+
 
 class DashboardGate(unittest.TestCase):
     @classmethod
@@ -296,6 +345,23 @@ class DashboardGate(unittest.TestCase):
         rules = {rule.rule for rule in self.dashboard.app.url_map.iter_rules()}
         self.assertIn("/stats", rules)
         self.assertIn("/api/stats", rules)
+
+    def test_entry_mode_filter_and_quality_breakdown(self):
+        records = [
+            {"close_time": 1, "direction": "BUY", "result": "loss", "entry_mode": "TBS_RETEST", "amd_phase": "ACCUMULATION", "pnl": {"pnl_pct": -1}},
+            {"close_time": 2, "direction": "BUY", "result": "win", "entry_mode": "STRONG", "amd_phase": "DISTRIBUTION", "pnl": {"pnl_pct": 2}},
+        ]
+        filtered = self.dashboard._filter_history(records, "all", "BOTH", "", "TBS_RETEST")
+        self.assertEqual(len(filtered), 1)
+        stats = self.dashboard._calc_stats(records)
+        self.assertEqual(stats["quality"]["entry_modes"], {"TBS_RETEST": 1, "STRONG": 1})
+        self.assertEqual(stats["quality"]["amd_phases"], {"ACCUMULATION": 1, "DISTRIBUTION": 1})
+
+    def test_dashboard_renders_entry_mode_and_analytics_directly(self):
+        source = (ROOT / "dashboard" / "app.py").read_text(encoding="utf-8")
+        self.assertIn("const modeParts = [p.entry_mode", source)
+        self.assertIn("Score / ATR", source)
+        self.assertNotIn("let modeStr = p.entry_mode || p.strategy || p.smc ?", source)
 
 
 class OperationalApiSecurityGate(unittest.TestCase):
