@@ -106,7 +106,7 @@ def _period_cutoff(period: str) -> float:
     }
     return mapping.get(period, 0)
 
-def _filter_history(history: list, period: str, direction: str, strategy_version: str = "") -> list:
+def _filter_history(history: list, period: str, direction: str) -> list:
     cutoff = _period_cutoff(period)
     result = []
     for r in history if isinstance(history, list) else []:
@@ -122,8 +122,6 @@ def _filter_history(history: list, period: str, direction: str, strategy_version
         if direction == "LONG" and dr != "BUY":
             continue
         if direction == "SHORT" and dr != "SELL":
-            continue
-        if strategy_version and str(r.get("strategy_version") or "legacy") != strategy_version:
             continue
         result.append(r)
     return result
@@ -248,16 +246,6 @@ def _calc_stats(trades: list) -> dict:
         if int(r.get("highest_tp_hit") or 0) != int((r.get("pnl") or {}).get("highest_tp") or 0)
         and isinstance(r.get("pnl"), dict)
     )
-    terminal_ids = [
-        str(r.get("instance_id") or r.get("trade_id") or "")
-        for r in trades
-        if r.get("instance_id") or r.get("trade_id")
-    ]
-    duplicate_terminal_events = len(terminal_ids) - len(set(terminal_ids))
-    version_counts = {}
-    for r in trades:
-        version = str(r.get("strategy_version") or "legacy")
-        version_counts[version] = version_counts.get(version, 0) + 1
     quality = {
         "pnl_known": pnl_scored,
         "pnl_missing": len(trades) - pnl_scored,
@@ -265,8 +253,6 @@ def _calc_stats(trades: list) -> dict:
         "positive_losses": positive_losses,
         "legacy_tp_above_4": legacy_tp_above_4,
         "tp_summary_disagreements": tp_summary_disagreements,
-        "duplicate_terminal_events": duplicate_terminal_events,
-        "strategy_versions": version_counts,
     }
 
     return {
@@ -318,10 +304,9 @@ def _build_breakdown(history: list, positions=None) -> list:
 def api_stats():
     period    = request.args.get("period", "all")
     direction = request.args.get("direction", "BOTH").upper()
-    strategy_version = request.args.get("strategy_version", "").strip()
 
     history = redis_get("trade_history") or []
-    filtered = _filter_history(history, period, direction, strategy_version)
+    filtered = _filter_history(history, period, direction)
     stats = _calc_stats(filtered)
     positions = redis_get("positions") or {}
     position_items = _position_items(positions)
@@ -335,7 +320,6 @@ def api_stats():
         "open_longs": open_longs,
         "open_shorts": open_shorts,
         "open_total": len(position_items),
-        "strategy_version_filter": strategy_version or None,
     })
 
 @app.route("/api/positions")
@@ -362,10 +346,7 @@ def api_positions():
             "trail_active": pos.get("trail_active", False),
             "trail_sl": pos.get("trail_sl"),
             "tp1_hit": pos.get("tp1_hit", False),
-            "be_active": pos.get("be_active", False),
-            "strategy_version": pos.get("strategy_version", "legacy"),
-            "schema_version": pos.get("schema_version", 1),
-            "tp_contract": pos.get("tp_contract", "legacy"),
+            "be_active": pos.get("tp1_hit", False),
             "created_at": pos.get("created_at"),
             "created_at_fmt": _ts_to_msk(pos.get("created_at")),
             "remaining_qty": pos.get("remaining_qty"),
@@ -394,10 +375,9 @@ def api_history():
     direction = request.args.get("direction", "BOTH").upper()
     page      = int(request.args.get("page", 1))
     per_page  = int(request.args.get("per_page", 50))
-    strategy_version = request.args.get("strategy_version", "").strip()
 
     history = redis_get("trade_history") or []
-    filtered = _filter_history(history, period, direction, strategy_version)
+    filtered = _filter_history(history, period, direction)
     # Sort newest first
     filtered.sort(key=lambda r: r.get("close_time", 0), reverse=True)
 
@@ -408,9 +388,6 @@ def api_history():
     for r in paginated:
         pnl_data = r.get("pnl") or {}
         rows.append({
-            "strategy_version": r.get("strategy_version", "legacy"),
-            "schema_version": r.get("schema_version", 1),
-            "tp_contract": r.get("tp_contract", "legacy"),
             "ticker": (r.get("ticker") or "").replace(".P", ""),
             "direction": (r.get("direction") or "").upper(),
             "result": r.get("result", ""),
@@ -458,14 +435,13 @@ def api_export():
     tab       = request.args.get("tab", "history")
     period    = request.args.get("period", "all")
     direction = request.args.get("direction", "BOTH").upper()
-    strategy_version = request.args.get("strategy_version", "").strip()
 
     if tab == "positions":
         positions = redis_get("positions") or {}
         data = [p for _, p in _position_items(positions)]
     else:
         history = redis_get("trade_history") or []
-        data = _filter_history(history, period, direction, strategy_version)
+        data = _filter_history(history, period, direction)
         data.sort(key=lambda r: r.get("close_time", 0), reverse=True)
 
     if fmt == "json":
@@ -1000,8 +976,8 @@ function renderKPIs(data) {
   }
   if (todayTpStr) badges += `<span class="tp-badge tp1" style="opacity:0.7; font-size:11px;">Today${todayTpStr}</span>`;
   const q = s.quality || {};
-  if ((q.pnl_missing || 0) + (q.negative_partials || 0) + (q.positive_losses || 0) + (q.legacy_tp_above_4 || 0) + (q.tp_summary_disagreements || 0) + (q.duplicate_terminal_events || 0) > 0) {
-    badges += `<span class="tp-badge be">⚠ Data: missing P&L ${q.pnl_missing||0}, partial≤0 ${q.negative_partials||0}, loss&gt;0 ${q.positive_losses||0}, TP mismatch ${q.tp_summary_disagreements||0}, legacy TP5+ ${q.legacy_tp_above_4||0}, duplicate terminal ${q.duplicate_terminal_events||0}</span>`;
+  if ((q.pnl_missing || 0) + (q.negative_partials || 0) + (q.positive_losses || 0) + (q.legacy_tp_above_4 || 0) + (q.tp_summary_disagreements || 0) > 0) {
+    badges += `<span class="tp-badge be">⚠ Data: missing P&L ${q.pnl_missing||0}, partial≤0 ${q.negative_partials||0}, loss&gt;0 ${q.positive_losses||0}, TP mismatch ${q.tp_summary_disagreements||0}, legacy TP5+ ${q.legacy_tp_above_4||0}</span>`;
   }
   tpRow.innerHTML = badges;
 }

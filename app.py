@@ -77,6 +77,12 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
+# Webhook/data contract.  These values are persisted with every new trade so
+# the dashboard can isolate a clean post-v153 cohort without rotating Redis.
+STRATEGY_VERSION = "v153"
+SCHEMA_VERSION = 2
+TP_CONTRACT = "4TP_20_25_30_25"
+
 # ══════════════════════════════════════════════════════════════════════════════
 # КОНФИГУРАЦИЯ
 # ══════════════════════════════════════════════════════════════════════════════
@@ -923,6 +929,24 @@ def cancel_own_orders(pos: dict) -> None:
             except Exception as e:
                 write_log(f"BYBIT_CANCEL_ID_WARN | {ticker} id={oid} | {e}")
 
+
+def cancel_sl_order(pos: dict) -> None:
+    """Cancel only the bot-owned SL.  TP orders must survive an SL move."""
+    if not pos or pos.get("exchange", "bybit") == "none":
+        return
+    order_id = pos.get("sl_order_id")
+    if not order_id or str(order_id) in ("ok", ""):
+        return
+    ticker = pos.get("symbol", "")
+    exchange = pos.get("exchange", "bybit")
+    if exchange == "bingx":
+        bingx_cancel_order_by_id(ticker, order_id)
+    else:
+        try:
+            bybit().cancel_order(category="linear", symbol=ticker, orderId=str(order_id))
+        except Exception as e:
+            write_log(f"BYBIT_CANCEL_SL_WARN | {ticker} id={order_id} | {e}")
+
 def get_bingx_balance() -> str:
     try:
         if BINGX_DEMO:
@@ -1117,7 +1141,7 @@ def move_sl(pos: dict, new_sl: float) -> str:
     # Не трогаем позиции без биржи или с нулевым объёмом
     if exchange == "none" or remaining <= 0:
         return ""
-    cancel_own_orders(pos)  # 🔒 только свои ордера этой позиции, не ручные юзера
+    cancel_sl_order(pos)  # TP1..TP4 remain active while only SL is replaced.
     time.sleep(0.3)
     try:
         resp = ex_place_stop(symbol, opp_side, remaining, new_sl, exchange)
@@ -1175,19 +1199,23 @@ def _highest_tp_hit(pos: dict | None) -> int:
     return max(hits, default=0)
 
 
-def update_stats(result: str):
-    """result: 'win' | 'loss' | 'partial'
-    BUG #5 FIX: partial = SL после TP1+ = прибыльная сделка → считается как WIN в WR.
-    stats.wins  = full TP wins + partial wins
-    stats.losses = pure SL (0 TP hits)
-    """
+def update_stats(result: str, pnl_pct: float | None = None):
+    """Update legacy bot counters using net P&L, never the partial label."""
     with _state_lock:
         s = load_stats()
         s["total"] = s.get("total", 0) + 1
-        if result in ("win", "partial"):
-            s["wins"] = s.get("wins", 0) + 1
+        if pnl_pct is not None and math.isfinite(float(pnl_pct)):
+            net_result = "win" if float(pnl_pct) > 0 else "loss" if float(pnl_pct) < 0 else "breakeven"
         else:
+            net_result = result if result in ("win", "loss") else "unscored"
+        if net_result == "win":
+            s["wins"] = s.get("wins", 0) + 1
+        elif net_result == "loss":
             s["losses"] = s.get("losses", 0) + 1
+        elif net_result == "breakeven":
+            s["breakeven"] = s.get("breakeven", 0) + 1
+        else:
+            s["unscored"] = s.get("unscored", 0) + 1
         save_stats(s)
 
 
@@ -1208,6 +1236,24 @@ def save_trade_to_history(payload: dict, trade_data: dict | None, result: str, t
     )
     instance_id = _trade_instance_id(trade_key, trade_data, pos, payload)
     record = {
+        "strategy_version": (
+            trade_data.get("strategy_version")
+            or pos.get("strategy_version")
+            or (payload.get("strategy_version") if not trade_data and not pos else None)
+            or "legacy"
+        ),
+        "schema_version": int(
+            trade_data.get("schema_version")
+            or pos.get("schema_version")
+            or (payload.get("schema_version") if not trade_data and not pos else None)
+            or 1
+        ),
+        "tp_contract": (
+            trade_data.get("tp_contract")
+            or pos.get("tp_contract")
+            or (payload.get("tp_contract") if not trade_data and not pos else None)
+            or "legacy"
+        ),
         "instance_id": instance_id,
         "trade_key": trade_key,
         "trade_id": (
@@ -1266,9 +1312,9 @@ def save_trade_to_history(payload: dict, trade_data: dict | None, result: str, t
         "date_msk": _msk().strftime("%Y-%m-%d"),
         "week_msk": f"{_msk().year}-W{_msk().isocalendar()[1]:02d}",
         "pnl": payload.get("_bot_pnl", {}),
-        # SL type detection: trail_active = trailing stop was on; tp1_hit = BE active
+        # Explicit execution state.  TP1 alone does not prove that SL moved.
         "trail_active": bool(pos.get("trail_active", False)),
-        "be_active":    bool(pos.get("tp1_hit", False)),  # TP1 hit → SL moved to BE
+        "be_active": bool(pos.get("be_active", False)),
     }
     with _state_lock:
         history = load_history()
@@ -1623,7 +1669,8 @@ def finalize_trade(payload: dict, trade_key: str | None, trade_data: dict | None
         write_log(f"FINALIZE_SKIP | {instance_id} already closed")
         return False
     if result in ("win", "loss", "partial"):
-        update_stats(result)
+        pnl_value = (payload.get("_bot_pnl") or {}).get("pnl_pct")
+        update_stats(result, pnl_value)
     save_trade_to_history(payload, trade_data, result, tp_num, close_reason=close_reason, pos=pos)
     if actual_key:
         remove_trade(actual_key)
@@ -1825,6 +1872,9 @@ def handle_entry(payload: dict):
     trade_message_id = entry_message.get("message_id") or source_msg_id
 
     trade_record = {
+        "strategy_version": str(payload.get("strategy_version") or STRATEGY_VERSION),
+        "schema_version": int(payload.get("schema_version") or SCHEMA_VERSION),
+        "tp_contract": str(payload.get("tp_contract") or TP_CONTRACT),
         "message_id": trade_message_id,
         "signal_message_id": source_msg_id,
         "chat_id": TG_CHAT,
@@ -1856,6 +1906,9 @@ def handle_entry(payload: dict):
     with _pos_lock:
         positions = load_positions()
         positions[pkey] = {
+            "strategy_version": str(payload.get("strategy_version") or STRATEGY_VERSION),
+            "schema_version": int(payload.get("schema_version") or SCHEMA_VERSION),
+            "tp_contract": str(payload.get("tp_contract") or TP_CONTRACT),
             "symbol": ticker,
             "ticker": ticker,
             "direction": direction,
@@ -1887,6 +1940,7 @@ def handle_entry(payload: dict):
             "created_at": created_at,
             "trail_active": False,
             "trail_sl": None,
+            "be_active": False,
         }
         save_positions(positions)
 
@@ -1960,12 +2014,12 @@ def handle_tp_hit(payload: dict):
             new_remaining = max(0.0, remaining - close_qty)
             for n in newly_hit:
                 pos[f"tp{n}_hit"] = True
+                tp_ids = pos.get("tp_order_ids")
+                if isinstance(tp_ids, dict):
+                    tp_ids.pop(n, None)
+                    tp_ids.pop(str(n), None)
             pos["remaining_qty"] = new_remaining
             highest_tp = _highest_tp_hit(pos)
-
-            if tp_num >= 2 and not pos["trail_active"]:
-                pos["trail_active"] = True
-                pos["trail_sl"]     = pos.get("sl_price")
 
             if new_remaining <= min_q or tp_num >= 4:
                 if exchange != "none":
@@ -1988,6 +2042,7 @@ def handle_tp_hit(payload: dict):
             highest_tp_hit=highest_tp,
             remaining_qty=pos_snapshot.get("remaining_qty"),
             trail_active=pos_snapshot.get("trail_active", False),
+            be_active=pos_snapshot.get("be_active", False),
         )
     if final_close:
         # Position fully closed at TP4 (or remaining ≤ min_qty).
@@ -2192,8 +2247,15 @@ def handle_sl_moved(payload: dict):
         direction=direction,
     )
 
-    new_sl = parse_price(text, "✅ Стало:", "Стало:")
+    try:
+        new_sl = float(payload.get("new_sl")) if payload.get("new_sl") is not None else None
+        if new_sl is not None and (not math.isfinite(new_sl) or new_sl <= 0):
+            new_sl = None
+    except (TypeError, ValueError):
+        new_sl = None
+    new_sl = new_sl or parse_price(text, "✅ Стало:", "Стало:")
     if not new_sl:
+        write_log(f"SL_MOVED_REJECT | {ticker} | missing/invalid new_sl")
         return
     pkey = pos_key(ticker, direction)
     with _pos_lock:
@@ -2206,12 +2268,30 @@ def handle_sl_moved(payload: dict):
         oid = ""
         if pos.get("exchange", "bybit") != "none":
             oid = move_sl(pos, new_sl)
+        entry = float(pos.get("entry_price") or 0.0)
+        tolerance = max(abs(entry) * 1e-5, 1e-10)
+        reason = str(payload.get("sl_reason") or text or "")
+        explicit_be = payload.get("be_active") is True
+        legacy_be = "TP1→Entry" in reason or "TP1->Entry" in reason
+        moved_to_entry = entry > 0 and abs(float(new_sl) - entry) <= tolerance
+        if moved_to_entry and (explicit_be or legacy_be):
+            pos["be_active"] = True
+        explicit_trail = payload.get("trail_active") is True
+        legacy_trail = "trail" in reason.lower() or "трейл" in reason.lower()
+        if explicit_trail or legacy_trail:
+            pos["trail_active"] = True
+            pos["trail_sl"] = new_sl
         pos["sl_price"]    = new_sl
         pos["sl_order_id"] = oid
         positions[pkey] = pos
         save_positions(positions)
     if trade_key:
-        touch_trade(trade_key, sl_price=new_sl)
+        touch_trade(
+            trade_key,
+            sl_price=new_sl,
+            be_active=bool(pos.get("be_active", False)),
+            trail_active=bool(pos.get("trail_active", False)),
+        )
 
 
 def close_position_manually(pos: dict, source: str) -> tuple[bool, str]:
@@ -3634,10 +3714,14 @@ def start_background_threads():
 # ══════════════════════════════════════════════════════════════════════════════
 # FLASK ROUTES
 # ══════════════════════════════════════════════════════════════════════════════
+@app.route("/")
 @app.route("/health")
 def health():
     return jsonify({
         "status":        "ok",
+        "strategy_version": STRATEGY_VERSION,
+        "schema_version": SCHEMA_VERSION,
+        "tp_contract": TP_CONTRACT,
         "testnet":       TESTNET,
         "bybit":         BYBIT_AVAILABLE,
         "bingx":         BINGX_AVAILABLE,
