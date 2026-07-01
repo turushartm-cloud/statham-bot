@@ -128,6 +128,35 @@ class BotScenarioGate(unittest.TestCase):
         self.assertEqual(row["atr_pct"], 1.25)
         self.assertEqual(row["amd_phase"], "ACCUMULATION")
 
+    def test_schema_v2_dimensions_and_excursions_reach_history(self):
+        payload = self.seed()
+        metadata = {
+            "signal_class": "TBS_RETEST", "aggressiveness_mode": "BALANC",
+            "trading_style_input": "AUTO", "trading_style": "SCALP",
+            "strategy": "STATHAM_SMC", "pattern": "SFP_SWEEP",
+            "family": "SMC_STRUCTURE", "session": "LONDON",
+            "mtf_alignment": 61.0, "bayes_probability": 0.75,
+            "config_be_tp1": True,
+        }
+        self.positions[next(iter(self.positions))].update(metadata)
+        self.trades["trade-1"].update(metadata)
+        self.bot.handle_sl_hit({**payload, "event": "sl_hit", "text": "Цена выхода: 95", "mfe_pct": 1.2, "mae_pct": 5.0})
+        row = self.history[-1]
+        self.assertEqual(row["signal_class"], "TBS_RETEST")
+        self.assertEqual(row["aggressiveness_mode"], "BALANC")
+        self.assertEqual(row["trading_style"], "SCALP")
+        self.assertEqual(row["family"], "SMC_STRUCTURE")
+        self.assertEqual(row["mfe_pct"], 1.2)
+        self.assertEqual(row["mae_pct"], 5.0)
+        self.assertTrue(row["entry_config"]["config_be_tp1"])
+
+    def test_sl_payload_recovers_missing_tp_webhooks(self):
+        payload = self.seed()
+        self.bot.handle_sl_hit({**payload, "event": "sl_hit", "text": "Цена выхода: 95", "highest_tp_hit": 2})
+        row = self.history[-1]
+        self.assertEqual(row["highest_tp_hit"], 2)
+        self.assertEqual(row["pnl"]["tps_hit"], [1, 2])
+
     def test_missing_trade_record_is_recovered_from_position(self):
         self.seed(trade_id="recover-me")
         self.trades.clear()
@@ -272,7 +301,16 @@ class StaticPineGate(unittest.TestCase):
             self.assertIn("f_reexit4(active_entry_id, active_exit_tag, active_sl)", source)
             self.assertIn("f_tp4_", source)
             self.assertIn('f_tg_emit_sl_moved', source)
-            self.assertIn('"entry_mode\\\":\\\"" + _entry_mode', source)
+            self.assertIn('"entry_mode\\\":\\\"" + _signal_class', source)
+            self.assertIn('"signal_class\\\":\\\"" + _signal_class', source)
+            self.assertIn('"aggressiveness_mode\\\":\\\"" + entry_mode', source)
+            self.assertIn('"trading_style\\\":\\\"" + trading_style', source)
+            self.assertIn('"mtf_alignment\\\":"', source)
+            self.assertIn('"bayes_probability\\\":"', source)
+            self.assertIn('"mfe_pct\\\":"', source)
+            self.assertIn('"mae_pct\\\":"', source)
+            self.assertIn("math.min(active_sl, trade_entry - atr_val)", source)
+            self.assertIn("math.max(active_sl, trade_entry + atr_val)", source)
             self.assertIn('"amd_phase\\\":\\\"" + f_json_escape(amd_phase)', source)
 
     def test_all_declared_inputs_are_referenced(self):
@@ -399,9 +437,24 @@ class DashboardGate(unittest.TestCase):
 
     def test_dashboard_renders_entry_mode_and_analytics_directly(self):
         source = (ROOT / "dashboard" / "app.py").read_text(encoding="utf-8")
-        self.assertIn("const modeParts = [p.entry_mode", source)
+        self.assertIn("const modeParts = [p.aggressiveness_mode, p.signal_class", source)
         self.assertIn("Score / ATR", source)
         self.assertNotIn("let modeStr = p.entry_mode || p.strategy || p.smc ?", source)
+
+    def test_clean_gate_rejects_missing_pnl_and_tp_mismatch(self):
+        records = [
+            {"close_time": 1, "direction": "BUY", "strategy_version": "v153", "highest_tp_hit": 1, "pnl": {"pnl_pct": 1, "highest_tp": 1}},
+            {"close_time": 2, "direction": "BUY", "strategy_version": "v153", "highest_tp_hit": 1, "pnl": {"pnl_pct": 1, "highest_tp": 0}},
+            {"close_time": 3, "direction": "BUY", "strategy_version": "v153", "highest_tp_hit": 0, "pnl": {}},
+        ]
+        filtered = self.dashboard._filter_history(records, "all", "BOTH", "v153", "", True)
+        self.assertEqual([r["close_time"] for r in filtered], [1])
+
+    def test_dashboard_defaults_to_clean_v153_cohort(self):
+        source = (ROOT / "dashboard" / "app.py").read_text(encoding="utf-8")
+        self.assertIn("cohort: 'v153'", source)
+        self.assertIn("quality_gate: state.cohort === 'ALL' ? 'false' : 'clean'", source)
+        self.assertIn('stats["quality"]["excluded_by_quality_gate"]', source)
 
 
 class OperationalApiSecurityGate(unittest.TestCase):
@@ -414,6 +467,8 @@ class OperationalApiSecurityGate(unittest.TestCase):
         self.assertEqual(client.get("/trades?secret=wrong").status_code, 403)
         self.assertEqual(client.get("/trades?secret=gate-secret").status_code, 200)
         self.assertEqual(client.get("/health").status_code, 200)
+        self.assertEqual(client.get("/audit/export").status_code, 403)
+        self.assertEqual(client.get("/audit/schema").status_code, 403)
 
 
 if __name__ == "__main__":
