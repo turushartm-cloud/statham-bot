@@ -2,6 +2,7 @@ import copy
 import importlib.util
 import pathlib
 import ast
+import re
 import unittest
 
 
@@ -142,15 +143,24 @@ class BotScenarioGate(unittest.TestCase):
         self.assertEqual(removed, 0)
         self.assertIn("old-live", self.trades)
 
-    def test_tp1_then_sl_is_partial_but_not_implicit_be(self):
+    def test_tp1_then_wide_sl_is_net_loss_not_implicit_be(self):
         payload = self.seed()
         self.bot.handle_tp_hit({**payload, "event": "tp_hit", "tp_num": 1})
         pos = next(iter(self.positions.values()))
         self.assertAlmostEqual(pos["remaining_qty"], 8.0)
         self.assertFalse(pos["be_active"])
         self.bot.handle_sl_hit({**payload, "event": "sl_hit", "text": "Цена выхода: 95"})
-        self.assertEqual(self.history[-1]["result"], "partial")
+        self.assertEqual(self.history[-1]["result"], "loss")
+        self.assertEqual(self.history[-1]["highest_tp_hit"], 1)
+        self.assertLess(self.history[-1]["pnl"]["pnl_pct"], 0)
         self.assertFalse(self.history[-1]["be_active"])
+
+    def test_tp1_then_profitable_sl_is_positive_partial(self):
+        payload = self.seed()
+        self.bot.handle_tp_hit({**payload, "event": "tp_hit", "tp_num": 1})
+        self.bot.handle_sl_hit({**payload, "event": "sl_hit", "text": "Цена выхода: 100.5"})
+        self.assertEqual(self.history[-1]["result"], "partial")
+        self.assertGreater(self.history[-1]["pnl"]["pnl_pct"], 0)
 
     def test_tp1_to_tp4_terminal_and_idempotent(self):
         payload = self.seed()
@@ -252,6 +262,15 @@ class StaticPineGate(unittest.TestCase):
             self.assertIn('qty_percent=25', source)
             self.assertIn('qty_percent=30', source)
             self.assertNotIn('not use_6_tp_levels and _hit_tp_num >= 1', source)
+            self.assertIsNone(
+                re.search(r"(?i)tp[56]|use_6_tp|f_(?:re)?exit6|f_tp6", source),
+                f"{filename}: legacy TP5/TP6 identifier remains",
+            )
+            self.assertIn("use_bar_magnifier=true", source)
+            self.assertIn("f_exit4", source)
+            self.assertIn("f_reexit4", source)
+            self.assertIn("f_reexit4(active_entry_id, active_exit_tag, active_sl)", source)
+            self.assertIn("f_tp4_", source)
             self.assertIn('f_tg_emit_sl_moved', source)
             self.assertIn('"entry_mode\\\":\\\"" + _entry_mode', source)
             self.assertIn('"amd_phase\\\":\\\"" + f_json_escape(amd_phase)', source)
@@ -318,9 +337,19 @@ class AdminAclGate(unittest.TestCase):
                 unguarded.append(node.name)
         self.assertEqual(unguarded, [])
 
-    def test_admin_user_ids_env_is_supported(self):
+    def test_existing_admin_ids_env_is_the_single_acl_source(self):
         source = (ROOT / "app.py").read_text(encoding="utf-8")
-        self.assertIn('os.environ.get("ADMIN_USER_IDS"', source)
+        render = (ROOT / "render.yaml").read_text(encoding="utf-8")
+        dashboard_render = (ROOT / "dashboard" / "render.yaml").read_text(encoding="utf-8")
+        dashboard_source = (ROOT / "dashboard" / "app.py").read_text(encoding="utf-8")
+        self.assertIn('os.environ.get("ADMIN_IDS"', source)
+        self.assertNotIn("ADMIN_USER_IDS", source)
+        self.assertIn("key: ADMIN_IDS", render)
+        self.assertNotIn("ADMIN_USER_IDS", render)
+        self.assertNotIn("name: statham-bot", dashboard_render)
+        self.assertNotIn("ADMIN_IDS", dashboard_render)
+        self.assertNotIn("ADMIN_IDS", dashboard_source)
+        self.assertIn("key: TG_ADMIN_ID", dashboard_render)
         self.assertIn("_EXCHANGE_SYNC_INTERVAL = 3600", source)
 
 
@@ -356,6 +385,17 @@ class DashboardGate(unittest.TestCase):
         stats = self.dashboard._calc_stats(records)
         self.assertEqual(stats["quality"]["entry_modes"], {"TBS_RETEST": 1, "STRONG": 1})
         self.assertEqual(stats["quality"]["amd_phases"], {"ACCUMULATION": 1, "DISTRIBUTION": 1})
+
+    def test_reached_tp_counts_survive_net_loss_classification(self):
+        records = [{
+            "close_time": 1, "direction": "SELL", "result": "loss",
+            "close_reason": "sl_hit", "highest_tp_hit": 1,
+            "pnl": {"pnl_pct": -13.67, "highest_tp": 1},
+        }]
+        stats = self.dashboard._calc_stats(records)
+        self.assertEqual(stats["tp_counts"], {1: 1, 2: 0, 3: 0, 4: 0})
+        self.assertEqual(stats["pure_sl_count"], 0)
+        self.assertEqual(stats["win_rate"], 0.0)
 
     def test_dashboard_renders_entry_mode_and_analytics_directly(self):
         source = (ROOT / "dashboard" / "app.py").read_text(encoding="utf-8")

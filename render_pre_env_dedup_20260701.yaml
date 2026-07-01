@@ -52,8 +52,8 @@ services:
         value: "YBUSDT,ASTERUSDT,EDGEUSDT,STOUSDT,UNIUSDT,SIRENUSDT,FARTCOINUSDT,WLDUSDT,ZBTUSDT,BLESSUSDT"
 
       # ── Администраторы (Telegram user_id) ────────────────────────
-      - key: ADMIN_IDS
-        sync: false          # существующий ENV, например 7617558315
+      - key: ADMIN_USER_IDS
+        value: "7617558315"
 
       # ── Торговля — глобальные дефолты ────────────────────────────
       - key: DEFAULT_LEVERAGE

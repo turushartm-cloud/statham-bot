@@ -24,7 +24,8 @@ Statham Trading Bot — RENDER (Unified v2.0)
   TG_SIGNALS_TOPIC    — ID ветки сигналов
   TG_SESSIONS_TOPIC   — ID ветки сессий/F&G
   RENDER_URL          — свой URL на Render (для keepalive)
-  ADMIN_IDS           — разрешённые Telegram user ID через запятую
+  ADMIN_USER_IDS      — разрешённые Telegram user ID через запятую
+  ADMIN_IDS           — legacy alias для ADMIN_USER_IDS
 
   # ── Bybit ────────────────────────────────────────────────────────
   BYBIT_API_KEY       — ключ Bybit
@@ -108,8 +109,12 @@ RENDER_SECRET    = (os.environ.get("RENDER_SECRET", "").strip()
 BYBIT_AVAILABLE = BYBIT_LIB and bool(BYBIT_API_KEY) and bool(BYBIT_API_SECRET)
 BINGX_AVAILABLE = bool(BINGX_API_KEY) and bool(BINGX_API_SECRET)
 
+_ADMIN_IDS_RAW = ",".join(filter(None, [
+    os.environ.get("ADMIN_USER_IDS", "").strip(),
+    os.environ.get("ADMIN_IDS", "").strip(),
+]))
 ADMIN_IDS = set(
-    int(x.strip()) for x in os.environ.get("ADMIN_IDS", "").split(",")
+    int(x.strip()) for x in _ADMIN_IDS_RAW.split(",")
     if x.strip().lstrip("-").isdigit()
 )
 
@@ -1378,23 +1383,26 @@ def _build_report(trades: list, title: str, show_last: int = 5,
     losses   = [r for r in trades if r["result"] == "loss"]
     partials = [r for r in trades if r["result"] == "partial"]
     manuals  = [r for r in trades if r["result"] == "manual"]
+    scored   = len(wins) + len(losses) + len(partials)
     total    = len(trades)
-    pnl_values = [float(r["pnl"]["pnl_pct"]) for r in trades
-                  if isinstance(r.get("pnl"), dict) and r["pnl"].get("pnl_pct") is not None]
-    wr = calc_winrate(sum(1 for p in pnl_values if p > 0.0), len(pnl_values))
+    # Partial = SL after TP1+ = profitable trade → count as win in WR
+    wr       = calc_winrate(len(wins) + len(partials), scored)
     if not trades:
         return f"{title}\n\n<i>Нет данных за период.</i>"
     avg_dur = int(sum(r.get("duration_sec", 0) for r in trades) / total) if total else 0
 
-    # Средний P&L из сохранённых расчётов бота; zero is valid breakeven.
+    # Средний P&L из сохранённых расчётов бота
+    # Skip zero P&L records (entry_price was None → stored 0.0)
+    pnl_values = [r["pnl"]["pnl_pct"] for r in trades
+                  if r.get("pnl") and r["pnl"].get("pnl_pct") != 0.0]
     avg_pnl = round(sum(pnl_values) / len(pnl_values), 2) if pnl_values else None
 
     # ── Разбивка по TP: считаем highest_tp_hit для всех закрытых сделок ─
-    # Reached targets are independent from the net-P&L classification.
+    # "wins" (TP4/remaining=0) и "partials" (SL после TP1-N) — обе считаются
     tp_counts: dict = {}      # {tp_num: count}
     tp_pnl_sums: dict = {}    # {tp_num: [tp_pnl_pct, ...]}  ← BUG #6 FIX: tp_pnl_pct не pnl_pct
-    for r in trades:
-        # highest_tp_hit — максимальный достигнутый TP в четырёхуровневом контракте.
+    for r in wins + partials:
+        # highest_tp_hit — максимальный достигнутый TP (для partial это TP1-5)
         n = int(r.get("highest_tp_hit") or r.get("tp_num") or 0)
         if n:
             tp_counts[n] = tp_counts.get(n, 0) + 1
@@ -1416,8 +1424,8 @@ def _build_report(trades: list, title: str, show_last: int = 5,
 
     # ── Основные цифры ───────────────────────────────────────────────
     text += f"📊 Win Rate: <b>{_wr_icon(wr)} {wr}%</b>\n"
-    pure_sl_count = sum(1 for r in trades if r.get("close_reason") == "sl_hit" and not int(r.get("highest_tp_hit") or 0))
-    text += (f"🏆 Full TP: {len(wins)}   🔶 Net+ Partial: {len(partials)}   ❌ Net Loss: {len(losses)}   Pure SL: {pure_sl_count}")
+    # BUG #6 FIX: правильные метки — Full TP / Partial / Pure SL
+    text += (f"🏆 Full TP: {len(wins)}   🔶 Partial: {len(partials)}   ❌ Pure SL: {len(losses)}")
     if manuals:
         text += f"   🧯 Manual: {len(manuals)}"
     text += f"\n📈 Всего закрыто: <b>{total}</b>\n"
@@ -2205,11 +2213,7 @@ def handle_sl_hit(payload: dict):
     # Формируем обогащённое сообщение (заменяем текст индикатора нашим)
     if _tps_hit_list:
         _tp_str = " → ".join(f"TP{n}" for n in _tps_hit_list)
-        _res_label = (
-            f"✅ Частичная прибыль ({_tp_str})"
-            if pnl["pnl_pct"] > 0
-            else f"⚠️ TP достигнут, но итоговый убыток ({_tp_str})"
-        )
+        _res_label = f"✅ Частичная прибыль ({_tp_str})"
     else:
         _res_label = "❌ Чистый убыток"
 
@@ -2250,10 +2254,15 @@ def handle_sl_hit(payload: dict):
         # Пересылаем оригинальный текст Pine Script для сравнения
         write_log(f"SL_HIT_PINESCRIPT_TEXT | {ticker} | {text[:120]}")
 
-    # Execution path and profitability are separate dimensions:
-    # highest_tp_hit records reached targets; result follows net P&L sign.
-    # This prevents a TP1→wide-SL trade with negative net P&L from becoming a win.
-    result = "partial" if highest_tp > 0 and pnl.get("pnl_pct", 0.0) > 0.0 else "loss"
+    # BUG #1 FIX: SL-выход НИКОГДА не является "win".
+    # "win" = позиция закрыта ПОЛНОСТЬЮ на TP (handle_tp_hit при remaining ≤ min_qty).
+    # "partial" = был хотя бы один TP hit, затем SL (прибыльная неполная сделка).
+    # "loss"    = чистый SL без единого TP hit.
+    # Независимо от биржи (exchange/none) — логика одинаковая.
+    if highest_tp > 0:
+        result = "partial"
+    else:
+        result = "loss"
 
     # Store pnl in finalize payload
     payload["_bot_pnl"] = pnl

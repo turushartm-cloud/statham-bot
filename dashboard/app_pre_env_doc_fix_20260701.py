@@ -7,6 +7,7 @@ Deploy as a separate service on Render.
 Environment variables:
   REDIS_URL          — rediss://default:...@...upstash.io:6379
   DASHBOARD_SECRET   — secret token for access (set in Render)
+  ADMIN_IDS          — comma-separated Telegram user IDs (optional, for future auth)
   PORT               — port (default 10000, Render sets this automatically)
   TG_TOKEN           — Telegram bot token (for admin notifications)
   TG_ADMIN_ID        — Telegram user ID to send PnL alerts
@@ -207,7 +208,7 @@ def _calc_stats(trades: list) -> dict:
     pure_sl_count = sum(1 for r in sl_records if _record_highest_tp(r) == 0)
     be_count = sum(1 for r in sl_records if r.get("be_active"))
 
-    for r in trades:
+    for r in wins + partials:
         highest = min(4, _record_highest_tp(r))
         if highest > 0:
             highest_tp_counts[highest] = highest_tp_counts.get(highest, 0) + 1
@@ -237,9 +238,10 @@ def _calc_stats(trades: list) -> dict:
     today_sl = len(today_sl_records)
     today_be = sum(1 for r in today_sl_records if r.get("be_active"))
     for r in today_trades:
-        highest = min(4, _record_highest_tp(r))
-        for n in range(1, highest + 1):
-            today_tp[n] += 1
+        if r.get("result") in ("win", "partial"):
+            highest = min(4, _record_highest_tp(r))
+            for n in range(1, highest + 1):
+                today_tp[n] += 1
 
     negative_partials = sum(1 for r, p in pnl_pairs if r.get("result") == "partial" and p is not None and p <= 0.0)
     positive_losses = sum(1 for r, p in pnl_pairs if r.get("result") == "loss" and p is not None and p > 0.0)
