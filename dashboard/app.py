@@ -1205,7 +1205,10 @@ function renderPositions() {
     const sigTag = p.is_strong
       ? '<span class="tag tag-strong">STRONG</span>'
       : '<span class="tag tag-normal">NORMAL</span>';
-    const modeParts = [p.aggressiveness_mode, p.signal_class, p.trading_style, p.family, p.pattern, p.amd_phase ? `AMD:${p.amd_phase}` : ''].filter(Boolean);
+    const styleMode = p.trading_style_input && p.trading_style && p.trading_style_input !== p.trading_style
+      ? `${p.trading_style_input}→${p.trading_style}`
+      : (p.trading_style || p.trading_style_input);
+    const modeParts = [p.aggressiveness_mode, p.signal_class, styleMode, p.family, p.pattern, p.amd_phase ? `AMD:${p.amd_phase}` : ''].filter(Boolean);
     const modeStr = modeParts.length ? modeParts.join(' + ') : '—';
     const analyticsStr = p.score == null
       ? '—'
@@ -1312,7 +1315,7 @@ function renderHistory(rows, total) {
       <td class="dur">${dur}</td>
       <td style="color:var(--cyan);font-size:11px">${[r.aggressiveness_mode, r.signal_class].filter(Boolean).join(' / ') || '—'}</td>
       <td style="color:var(--muted);font-size:11px">${analyticsStr}</td>
-      <td style="color:var(--muted);font-size:11px">${r.style || '—'}</td>
+      <td style="color:var(--muted);font-size:11px">${r.trading_style_input && r.style && r.trading_style_input !== r.style ? `${r.trading_style_input}→${r.style}` : (r.style || r.trading_style_input || '—')}</td>
       <td style="color:var(--muted);font-size:11px">${r.timeframe || '—'}</td>
       <td style="color:var(--muted);font-size:11px">${[r.family, r.pattern, r.session].filter(Boolean).join(' / ') || '—'}</td>
       <td style="color:var(--muted);font-size:11px">${r.leverage ? r.leverage+'x' : '—'}</td>
