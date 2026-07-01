@@ -57,7 +57,7 @@ services:
 
       # ── Торговля — глобальные дефолты ────────────────────────────
       - key: DEFAULT_LEVERAGE
-        value: "20"
+        value: "10"
       - key: DEFAULT_SIZE_USDT
         value: "0.25"
       - key: TRAIL_PCT

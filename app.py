@@ -334,6 +334,7 @@ POSITIONS_FILE  = os.path.join(DATA_DIR, "positions.json")
 FG_STATE_FILE   = os.path.join(DATA_DIR, "fg_state.json")
 SENT_FLAGS_FILE = os.path.join(DATA_DIR, "sent_flags.json")
 CLOSED_TRADES_FILE = os.path.join(DATA_DIR, "closed_trades.json")
+EQUITY_HISTORY_FILE = os.path.join(DATA_DIR, "equity_history.json")
 LOG_FILE        = os.path.join(DATA_DIR, "bot.log")
 
 MAX_QUEUE_ATTEMPTS = 3
@@ -808,7 +809,7 @@ def _bingx_req(method: str, path: str, params: dict | None = None) -> dict:
         hashlib.sha256,
     ).hexdigest()
     url     = BINGX_BASE + path + "?" + query + "&signature=" + sig
-    headers = {"X-BX-APIKEY": BINGX_API_KEY}
+    headers = {"X-BX-APIKEY": BINGX_API_KEY, "X-SOURCE-KEY": "BX-AI-SKILL"}
     if method == "GET":
         resp = requests.get(url, headers=headers, timeout=10)
     elif method == "POST":
@@ -977,6 +978,81 @@ def get_bingx_balance() -> str:
                 f"Доступно: <b>{float(avail):.2f} USDT</b>")
     except Exception as e:
         return f"❌ Ошибка BingX: {e}"
+
+
+def _bingx_balance_data() -> dict:
+    """Read-only normalized balance payload for audit/equity snapshots."""
+    paths = (["/openApi/swap/v2/user/balance", "/openApi/swap/v3/user/balance"]
+             if BINGX_DEMO else
+             ["/openApi/swap/v3/user/balance", "/openApi/swap/v2/user/balance"])
+    last_error = None
+    for path in paths:
+        try:
+            raw = _bingx_req("GET", path, {})
+            balance = (raw.get("data") or {}).get("balance", {})
+            if isinstance(balance, list):
+                balance = balance[0] if balance else {}
+            return {"endpoint": path, **(balance if isinstance(balance, dict) else {})}
+        except Exception as exc:
+            last_error = exc
+    raise RuntimeError(f"BingX balance unavailable: {last_error}")
+
+
+def _snapshot_equity() -> dict | None:
+    if not BINGX_AVAILABLE:
+        return None
+    try:
+        balance = _bingx_balance_data()
+        row = {
+            "time": int(time.time()),
+            "time_msk": _msk().isoformat(),
+            "exchange": "bingx",
+            "demo": BINGX_DEMO,
+            "equity": balance.get("equity"),
+            "available_margin": balance.get("availableMargin") or balance.get("availableMarginV2"),
+            "unrealized_profit": balance.get("unrealizedProfit"),
+            "used_margin": balance.get("usedMargin") or balance.get("usedMarginV2"),
+        }
+        history = load_json(EQUITY_HISTORY_FILE, [])
+        history.append(row)
+        # 90 days of hourly observations with a small safety margin.
+        save_json(EQUITY_HISTORY_FILE, history[-2200:])
+        return row
+    except Exception as exc:
+        write_log(f"EQUITY_SNAPSHOT_ERR | {exc}")
+        return None
+
+
+def _bingx_audit_export(days: int = 30, limit: int = 1000) -> dict:
+    """Read-only exchange ground truth: equity, fills and fee/funding ledger."""
+    days = max(1, min(int(days), 90))
+    limit = max(1, min(int(limit), 1000))
+    now_ms = int(time.time() * 1000)
+    params = {"startTime": now_ms - days * 86400000, "endTime": now_ms, "limit": limit}
+    result = {
+        "generated_at": int(time.time()),
+        "range_days": days,
+        "equity_history": load_json(EQUITY_HISTORY_FILE, []),
+        "balance": None,
+        "fills": [],
+        "income": [],
+        "errors": {},
+    }
+    try:
+        result["balance"] = _bingx_balance_data()
+    except Exception as exc:
+        result["errors"]["balance"] = str(exc)
+    try:
+        data = _bingx_req("GET", "/openApi/swap/v2/trade/allFillOrders", dict(params))
+        result["fills"] = (data.get("data") if isinstance(data, dict) else data) or []
+    except Exception as exc:
+        result["errors"]["fills"] = str(exc)
+    try:
+        data = _bingx_req("GET", "/openApi/swap/v2/user/income", dict(params))
+        result["income"] = (data.get("data") if isinstance(data, dict) else data) or []
+    except Exception as exc:
+        result["errors"]["income"] = str(exc)
+    return result
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1205,6 +1281,35 @@ def _highest_tp_hit(pos: dict | None) -> int:
     return max(hits, default=0)
 
 
+ENTRY_METADATA_FIELDS = (
+    "signal_class", "aggressiveness_mode", "trading_style_input", "trading_style",
+    "strategy", "pattern", "family", "session", "mtf_alignment",
+    "bayes_probability", "mfe_pct", "mae_pct", "config_mtf_threshold",
+    "config_bayes_threshold", "config_be_tp1", "config_be_tp2",
+    "config_trail_tp3", "config_cascade_sl", "config_counter_trend",
+    "config_strong_sensitivity",
+)
+
+
+def _entry_metadata(payload: dict | None) -> dict:
+    """Normalize schema-v2 entry telemetry without overloading entry_mode."""
+    payload = payload or {}
+    signal_class = str(payload.get("signal_class") or payload.get("entry_mode") or "")
+    out = {field: payload.get(field) for field in ENTRY_METADATA_FIELDS if field in payload}
+    out["signal_class"] = signal_class
+    # Compatibility alias for pre-v154 dashboard clients.
+    out["entry_mode"] = signal_class
+    out["aggressiveness_mode"] = str(payload.get("aggressiveness_mode") or "")
+    return out
+
+
+def _normalize_tp_flags(pos: dict, highest_tp: int) -> None:
+    """A reached TPn implies TP1..TPn; restore flags after missing webhooks."""
+    highest_tp = max(0, min(int(highest_tp or 0), 4))
+    for n in range(1, highest_tp + 1):
+        pos[f"tp{n}_hit"] = True
+
+
 def update_stats(result: str, pnl_pct: float | None = None):
     """Update legacy bot counters using net P&L, never the partial label."""
     with _state_lock:
@@ -1300,6 +1405,30 @@ def save_trade_to_history(payload: dict, trade_data: dict | None, result: str, t
         "entry_mode": (
             trade_data.get("entry_mode") or pos.get("entry_mode") or payload.get("entry_mode") or ""
         ),
+        "signal_class": (
+            trade_data.get("signal_class") or pos.get("signal_class")
+            or payload.get("signal_class") or trade_data.get("entry_mode")
+            or pos.get("entry_mode") or payload.get("entry_mode") or ""
+        ),
+        "aggressiveness_mode": (
+            trade_data.get("aggressiveness_mode") or pos.get("aggressiveness_mode")
+            or payload.get("aggressiveness_mode") or ""
+        ),
+        "trading_style_input": trade_data.get("trading_style_input", pos.get("trading_style_input", payload.get("trading_style_input"))),
+        "trading_style": trade_data.get("trading_style", pos.get("trading_style", payload.get("trading_style"))),
+        "strategy": trade_data.get("strategy", pos.get("strategy", payload.get("strategy"))),
+        "pattern": trade_data.get("pattern", pos.get("pattern", payload.get("pattern"))),
+        "family": trade_data.get("family", pos.get("family", payload.get("family"))),
+        "session": trade_data.get("session", pos.get("session", payload.get("session"))),
+        "mtf_alignment": trade_data.get("mtf_alignment", pos.get("mtf_alignment", payload.get("mtf_alignment"))),
+        "bayes_probability": trade_data.get("bayes_probability", pos.get("bayes_probability", payload.get("bayes_probability"))),
+        # Excursions evolve during the trade, so terminal payload has priority.
+        "mfe_pct": payload.get("mfe_pct", pos.get("mfe_pct", trade_data.get("mfe_pct"))),
+        "mae_pct": payload.get("mae_pct", pos.get("mae_pct", trade_data.get("mae_pct"))),
+        "entry_config": {
+            field: trade_data.get(field, pos.get(field, payload.get(field)))
+            for field in ENTRY_METADATA_FIELDS if field.startswith("config_")
+        },
         "score": trade_data.get("score", pos.get("score", payload.get("score"))),
         "confirmations": trade_data.get(
             "confirmations", pos.get("confirmations", payload.get("confirmations"))
@@ -1738,6 +1867,13 @@ def handle_entry(payload: dict):
     leverage  = int(cfg["leverage"])
     size_usdt = float(cfg["size_usdt"])
 
+    # Risk gate: leverage cannot repair a negative edge.  Cap all new entries
+    # at 10x and volatile entries (ATR >= 1.5%) at 5x. Pair overrides may lower
+    # these values but can no longer silently restore legacy 20x exposure.
+    atr_pct_val = float(payload.get("atr_pct", 0) or 0)
+    leverage_cap = 5 if atr_pct_val >= 1.5 else 10
+    leverage = max(1, min(leverage, leverage_cap))
+
     # ── Хелпер: безопасный float из payload-поля ──────────────────────
     def _to_float(val) -> float | None:
         """NaN / Inf / null / 'NaN' / пустые строки → None."""
@@ -1780,7 +1916,6 @@ def handle_entry(payload: dict):
 
     # ── Диагностика — видно что распарсилось ──────────────────────────
     # ✅ IMPROVEMENT #1: SL fallback when Pine Script sends null
-    atr_pct_val = float(payload.get("atr_pct", 0) or 0)
     if sl_price is None and price and price > 0:
         atr_fallback_pct = atr_pct_val if atr_pct_val > 0 else 2.0
         atr_abs = price * atr_fallback_pct / 100.0
@@ -1911,6 +2046,7 @@ def handle_entry(payload: dict):
         "confirmations": payload.get("confirmations"),
         "atr_pct": payload.get("atr_pct"),
         "amd_phase": str(payload.get("amd_phase") or ""),
+        **_entry_metadata(payload),
         "created_at": created_at,
         "entry_price": price,
         "total_qty": qty,
@@ -1962,6 +2098,7 @@ def handle_entry(payload: dict):
             "confirmations": payload.get("confirmations"),
             "atr_pct": payload.get("atr_pct"),
             "amd_phase": str(payload.get("amd_phase") or ""),
+            **_entry_metadata(payload),
             "message_id": trade_message_id,
             "signal_message_id": source_msg_id,
             "created_at": created_at,
@@ -2122,7 +2259,8 @@ def handle_sl_hit(payload: dict):
             _found_pos_sl = False
         else:
             exchange = pos.get("exchange", "bybit")
-            highest_tp = _highest_tp_hit(pos)
+            highest_tp = max(_highest_tp_hit(pos), int(payload.get("highest_tp_hit") or 0))
+            _normalize_tp_flags(pos, highest_tp)
             pos_snapshot = dict(pos)
             if exchange != "none":
                 cancel_own_orders(pos)  # 🔒 только свои ордера, не ручные юзера
@@ -2627,6 +2765,14 @@ def _scheduler():
             cur   = msk.hour * 60 + msk.minute
             h, m  = msk.hour, msk.minute
             today = msk.strftime("%Y-%m-%d")
+
+            # Portfolio ground truth: one exchange-equity observation per hour.
+            # This does not place/cancel orders and is safe in live/demo modes.
+            if 0 <= m <= 1:
+                equity_key = f"equity_{today}_{h:02d}"
+                if not _was_sent(equity_key):
+                    _mark_sent(equity_key)
+                    _snapshot_equity()
 
             if h in FG_SCHEDULED_HOURS and 0 <= m <= 1:
                 fg_key = f"fg_{today}_{h:02d}"
@@ -3976,6 +4122,41 @@ def positions_route():
     if not _http_auth(request):
         return jsonify({"error": "forbidden"}), 403
     return jsonify(load_positions())
+
+
+@app.route("/audit/export")
+def audit_export_route():
+    """Protected read-only P&L ground truth: BingX ledger + equity snapshots."""
+    if not _http_auth(request):
+        return jsonify({"error": "forbidden"}), 403
+    if not BINGX_AVAILABLE:
+        return jsonify({"error": "bingx unavailable"}), 503
+    try:
+        days = int(request.args.get("days", 30))
+        limit = int(request.args.get("limit", 1000))
+    except (TypeError, ValueError):
+        return jsonify({"error": "days/limit must be integers"}), 400
+    return jsonify(_bingx_audit_export(days, limit))
+
+
+@app.route("/audit/schema")
+def audit_schema_route():
+    """Show the telemetry contract and configs already captured in Redis."""
+    if not _http_auth(request):
+        return jsonify({"error": "forbidden"}), 403
+    positions = list(load_positions().values())
+    history = load_history()
+    latest = sorted(
+        [r for r in history if isinstance(r, dict)],
+        key=lambda r: r.get("close_time", 0), reverse=True,
+    )[:20]
+    return jsonify({
+        "strategy_version": STRATEGY_VERSION,
+        "schema_version": SCHEMA_VERSION,
+        "required_entry_fields": list(ENTRY_METADATA_FIELDS),
+        "open_positions": [{k: p.get(k) for k in ENTRY_METADATA_FIELDS} for p in positions],
+        "latest_closed": [{k: r.get(k) for k in ENTRY_METADATA_FIELDS} for r in latest],
+    })
 
 
 @app.route("/close_all", methods=["POST"])

@@ -106,7 +106,8 @@ def _period_cutoff(period: str) -> float:
     return mapping.get(period, 0)
 
 def _filter_history(history: list, period: str, direction: str,
-                    strategy_version: str = "", entry_mode: str = "") -> list:
+                    strategy_version: str = "", entry_mode: str = "",
+                    quality_gate: bool = False) -> list:
     cutoff = _period_cutoff(period)
     result = []
     for r in history if isinstance(history, list) else []:
@@ -125,7 +126,13 @@ def _filter_history(history: list, period: str, direction: str,
             continue
         if strategy_version and str(r.get("strategy_version") or "legacy") != strategy_version:
             continue
-        if entry_mode and str(r.get("entry_mode") or "").upper() != entry_mode.upper():
+        signal_class = str(r.get("signal_class") or r.get("entry_mode") or "")
+        if entry_mode and signal_class.upper() != entry_mode.upper():
+            continue
+        if quality_gate and isinstance(r.get("pnl"), dict):
+            if int(r.get("highest_tp_hit") or 0) != int((r.get("pnl") or {}).get("highest_tp") or 0):
+                continue
+        if quality_gate and _safe_pnl(r) is None:
             continue
         result.append(r)
     return result
@@ -258,6 +265,7 @@ def _calc_stats(trades: list) -> dict:
     version_counts = {}
     entry_mode_counts = {}
     amd_phase_counts = {}
+    dimension_counts = {k: {} for k in ("signal_class", "aggressiveness_mode", "trading_style", "pattern", "family", "session", "timeframe", "strategy")}
     for r in trades:
         version = str(r.get("strategy_version") or "legacy")
         version_counts[version] = version_counts.get(version, 0) + 1
@@ -265,6 +273,9 @@ def _calc_stats(trades: list) -> dict:
         entry_mode_counts[mode] = entry_mode_counts.get(mode, 0) + 1
         phase = str(r.get("amd_phase") or "unknown")
         amd_phase_counts[phase] = amd_phase_counts.get(phase, 0) + 1
+        for field, counts in dimension_counts.items():
+            value = str(r.get(field) or (r.get("entry_mode") if field == "signal_class" else "unknown"))
+            counts[value] = counts.get(value, 0) + 1
     quality = {
         "pnl_known": pnl_scored,
         "pnl_missing": len(trades) - pnl_scored,
@@ -276,6 +287,7 @@ def _calc_stats(trades: list) -> dict:
         "strategy_versions": version_counts,
         "entry_modes": entry_mode_counts,
         "amd_phases": amd_phase_counts,
+        "dimensions": dimension_counts,
     }
 
     return {
@@ -330,10 +342,17 @@ def api_stats():
     direction = request.args.get("direction", "BOTH").upper()
     strategy_version = request.args.get("strategy_version", "").strip()
     entry_mode = request.args.get("entry_mode", "").strip()
+    quality_gate = request.args.get("quality_gate", "").lower() in ("1", "true", "clean")
 
     history = redis_get("trade_history") or []
-    filtered = _filter_history(history, period, direction, strategy_version, entry_mode)
+    cohort = _filter_history(history, period, direction, strategy_version, entry_mode, False)
+    filtered = _filter_history(history, period, direction, strategy_version, entry_mode, quality_gate)
     stats = _calc_stats(filtered)
+    if quality_gate:
+        # Headline metrics use clean records, but the warning strip must still
+        # expose excluded corrupt records instead of manufacturing quality=0.
+        stats["quality"] = _calc_stats(cohort)["quality"]
+        stats["quality"]["excluded_by_quality_gate"] = len(cohort) - len(filtered)
     positions = redis_get("positions") or {}
     position_items = _position_items(positions)
     breakdown = _build_breakdown(filtered, positions)
@@ -348,6 +367,7 @@ def api_stats():
         "open_total": len(position_items),
         "strategy_version_filter": strategy_version or None,
         "entry_mode_filter": entry_mode or None,
+        "quality_gate": quality_gate,
     })
 
 @app.route("/api/positions")
@@ -384,8 +404,18 @@ def api_positions():
             "total_qty": pos.get("total_qty"),
             # Extended metadata (if patched)
             "entry_mode": pos.get("entry_mode"),
-            "style": pos.get("style"),
+            "signal_class": pos.get("signal_class") or pos.get("entry_mode"),
+            "aggressiveness_mode": pos.get("aggressiveness_mode"),
+            "trading_style_input": pos.get("trading_style_input"),
+            "trading_style": pos.get("trading_style") or pos.get("style"),
+            "style": pos.get("trading_style") or pos.get("style"),
             "pattern": pos.get("pattern"),
+            "family": pos.get("family"),
+            "session": pos.get("session"),
+            "mtf_alignment": pos.get("mtf_alignment"),
+            "bayes_probability": pos.get("bayes_probability"),
+            "mfe_pct": pos.get("mfe_pct"),
+            "mae_pct": pos.get("mae_pct"),
             "margin": pos.get("margin"),
             "fib_level": pos.get("fib_level"),
             "wyckoff_phase": pos.get("wyckoff_phase"),
@@ -411,9 +441,10 @@ def api_history():
     per_page  = int(request.args.get("per_page", 50))
     strategy_version = request.args.get("strategy_version", "").strip()
     entry_mode = request.args.get("entry_mode", "").strip()
+    quality_gate = request.args.get("quality_gate", "").lower() in ("1", "true", "clean")
 
     history = redis_get("trade_history") or []
-    filtered = _filter_history(history, period, direction, strategy_version, entry_mode)
+    filtered = _filter_history(history, period, direction, strategy_version, entry_mode, quality_gate)
     # Sort newest first
     filtered.sort(key=lambda r: r.get("close_time", 0), reverse=True)
 
@@ -451,8 +482,19 @@ def api_history():
             "be_active": r.get("be_active", False),
             # Extended metadata
             "entry_mode": r.get("entry_mode"),
-            "style": r.get("style"),
+            "signal_class": r.get("signal_class") or r.get("entry_mode"),
+            "aggressiveness_mode": r.get("aggressiveness_mode"),
+            "trading_style_input": r.get("trading_style_input"),
+            "trading_style": r.get("trading_style") or r.get("style"),
+            "style": r.get("trading_style") or r.get("style"),
             "pattern": r.get("pattern"),
+            "family": r.get("family"),
+            "session": r.get("session"),
+            "mtf_alignment": r.get("mtf_alignment"),
+            "bayes_probability": r.get("bayes_probability"),
+            "mfe_pct": r.get("mfe_pct"),
+            "mae_pct": r.get("mae_pct"),
+            "entry_config": r.get("entry_config") or {},
             "timeframe_tf": r.get("timeframe"),
             "leverage": r.get("leverage"),
             "margin": r.get("margin"),
@@ -823,6 +865,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             <button class="filter-btn" data-val="SHORT" onclick="setDirection('SHORT',this)">SHORT</button>
             <button class="filter-btn active" data-val="BOTH" onclick="setDirection('BOTH',this)">BOTH</button>
           </div>
+          <div class="filter-sep"></div>
+          <span class="filter-label">Cohort</span>
+          <div class="filter-group" id="cohort-btns">
+            <button class="filter-btn active" data-val="v153" onclick="setCohort('v153',this)">v153 CLEAN</button>
+            <button class="filter-btn" data-val="ALL" onclick="setCohort('ALL',this)">LEGACY+ALL</button>
+          </div>
         </div>
 
         <!-- KPI Cards -->
@@ -905,6 +953,7 @@ let state = {
   tab: 'stats',
   period: 'all',
   direction: 'BOTH',
+  cohort: 'v153',
   posDir: 'BOTH',
   histPeriod: '1w',
   histDir: 'BOTH',
@@ -947,6 +996,7 @@ function setActive(groupId, val) {
 }
 function setPeriod(val) { state.period = val; setActive('period-btns', val); loadStats(); }
 function setDirection(val) { state.direction = val; setActive('dir-btns', val); loadStats(); }
+function setCohort(val) { state.cohort = val; setActive('cohort-btns', val); loadStats(); loadHistory(); }
 function setPosDir(val, btn) { state.posDir = val; setActive('pos-dir-btns', val); renderPositions(); }
 function setHistPeriod(val) { state.histPeriod = val; state.histPage = 1; setActive('hist-period-btns', val); loadHistory(); }
 function setHistDir(val) { state.histDir = val; state.histPage = 1; setActive('hist-dir-btns', val); loadHistory(); }
@@ -954,7 +1004,12 @@ function setHistDir(val) { state.histDir = val; state.histPage = 1; setActive('h
 // ── Stats ──────────────────────────────────────────────────────────────────────
 async function loadStats() {
   try {
-    const data = await fetchJSON('/stats', { period: state.period, direction: state.direction });
+    const data = await fetchJSON('/stats', {
+      period: state.period,
+      direction: state.direction,
+      strategy_version: state.cohort === 'ALL' ? '' : state.cohort,
+      quality_gate: state.cohort === 'ALL' ? 'false' : 'clean',
+    });
     renderKPIs(data);
     renderBreakdown(data.breakdown);
     renderChart(data.stats.daily_pnl);
@@ -1150,11 +1205,11 @@ function renderPositions() {
     const sigTag = p.is_strong
       ? '<span class="tag tag-strong">STRONG</span>'
       : '<span class="tag tag-normal">NORMAL</span>';
-    const modeParts = [p.entry_mode, p.wyckoff_phase ? 'Wyckoff' : '', p.ict ? 'ICT' : '', p.amd_phase ? `AMD:${p.amd_phase}` : ''].filter(Boolean);
+    const modeParts = [p.aggressiveness_mode, p.signal_class, p.trading_style, p.family, p.pattern, p.amd_phase ? `AMD:${p.amd_phase}` : ''].filter(Boolean);
     const modeStr = modeParts.length ? modeParts.join(' + ') : '—';
     const analyticsStr = p.score == null
       ? '—'
-      : `${Number(p.score).toFixed(1)} / C${p.confirmations ?? '—'} / ATR ${p.atr_pct ?? '—'}%`;
+      : `${Number(p.score).toFixed(1)} / C${p.confirmations ?? '—'} / ATR ${p.atr_pct ?? '—'}% / MTF ${p.mtf_alignment ?? '—'} / B ${p.bayes_probability ?? '—'}`;
     let beTrail = '';
     if (p.trail_active) beTrail = '<span class="tag tag-trail">TRAIL</span>';
     else if (p.be_active) beTrail = '<span class="tag tag-be">BE</span>';
@@ -1191,6 +1246,8 @@ async function loadHistory() {
       direction: state.histDir,
       page: state.histPage,
       per_page: 50,
+      strategy_version: state.cohort === 'ALL' ? '' : state.cohort,
+      quality_gate: state.cohort === 'ALL' ? 'false' : 'clean',
     });
     state.histTotal = data.total;
     renderHistory(data.rows, data.total);
@@ -1253,11 +1310,11 @@ function renderHistory(rows, total) {
       <td class="${pnlClass}">${pnlStr}</td>
       <td class="pnl-pos">${tpPnlStr}</td>
       <td class="dur">${dur}</td>
-      <td style="color:var(--cyan);font-size:11px">${r.entry_mode || '—'}</td>
+      <td style="color:var(--cyan);font-size:11px">${[r.aggressiveness_mode, r.signal_class].filter(Boolean).join(' / ') || '—'}</td>
       <td style="color:var(--muted);font-size:11px">${analyticsStr}</td>
       <td style="color:var(--muted);font-size:11px">${r.style || '—'}</td>
       <td style="color:var(--muted);font-size:11px">${r.timeframe || '—'}</td>
-      <td style="color:var(--muted);font-size:11px">${r.pattern || '—'}</td>
+      <td style="color:var(--muted);font-size:11px">${[r.family, r.pattern, r.session].filter(Boolean).join(' / ') || '—'}</td>
       <td style="color:var(--muted);font-size:11px">${r.leverage ? r.leverage+'x' : '—'}</td>
       <td style="color:var(--muted);font-size:11px">${r.exchange || '—'}</td>
       <td>${details || '<span style="color:var(--muted)">—</span>'}</td>
