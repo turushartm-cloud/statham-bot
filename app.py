@@ -734,6 +734,23 @@ def bybit_place_market(symbol: str, side: str, qty: float, reduce_only: bool = F
     return resp
 
 
+def bybit_live_position_qty(symbol: str, direction: str) -> float:
+    """Read actual Bybit position size after market fill. direction: BUY/SELL."""
+    try:
+        resp = bybit().get_positions(category="linear", symbol=symbol)
+        rows = ((resp.get("result") or {}).get("list") or [])
+        want_side = "Buy" if str(direction).upper() == "BUY" else "Sell"
+        for row in rows:
+            if str(row.get("side") or "") != want_side:
+                continue
+            size = abs(float(row.get("size") or 0))
+            if size > 0:
+                return size
+    except Exception as e:
+        write_log(f"BYBIT_LIVE_QTY_WARN | {symbol} {direction} | {e}")
+    return 0.0
+
+
 def bybit_place_stop(symbol: str, side: str, qty: float,
                      trigger_price: float, reduce_only: bool = True) -> dict:
     # triggerDirection: 1 = price rises above triggerPrice (SHORT SL → side=Buy)
@@ -861,22 +878,26 @@ def bingx_place_market(ticker: str, side: str, qty: float,
     return data
 
 
-def bingx_live_position_qty(ticker: str, pos_side: str) -> float | None:
-    """Return absolute live BingX position qty for LONG/SHORT side."""
+def bingx_live_position_qty(ticker: str, direction: str) -> float:
+    """Read actual BingX position size after market fill. direction: BUY/SELL."""
     try:
         sym = _bingx_to_symbol(ticker)
-        target = str(pos_side or "").upper()
+        want_pos = "LONG" if str(direction).upper() == "BUY" else "SHORT"
         data = _bingx_req("GET", "/openApi/swap/v2/user/positions", {})
-        for p in data.get("data", []) or []:
-            if str(p.get("symbol") or "").upper() != sym:
+        rows = data.get("data") or []
+        if isinstance(rows, dict):
+            rows = rows.get("positions") or rows.get("list") or []
+        for row in rows:
+            if str(row.get("symbol") or "").upper() != sym.upper():
                 continue
-            side = str(p.get("positionSide") or "").upper()
-            amt = abs(float(p.get("positionAmt", 0) or 0))
-            if side == target and amt > 0:
-                return amt
+            if str(row.get("positionSide") or "").upper() != want_pos:
+                continue
+            size = abs(float(row.get("positionAmt") or row.get("availableAmt") or 0))
+            if size > 0:
+                return size
     except Exception as e:
-        write_log(f"BINGX_POS_QTY_WARN | {ticker} {pos_side} | {e}")
-    return None
+        write_log(f"BINGX_LIVE_QTY_WARN | {ticker} {direction} | {e}")
+    return 0.0
 
 
 def bingx_place_stop(ticker: str, side: str, qty: float,
@@ -886,12 +907,10 @@ def bingx_place_stop(ticker: str, side: str, qty: float,
     pos_side = ("LONG" if bx_side == "BUY" else "SHORT") if not reduce_only \
                else ("SHORT" if bx_side == "BUY" else "LONG")
     # BingX fills may be slightly less than ordered qty (exchange rounding).
-    # Use live position qty when available, then floor so reduce-only SL <= real position.
-    live_qty = bingx_live_position_qty(ticker, pos_side) if reduce_only else None
-    base_qty = min(qty, live_qty) if live_qty and live_qty > 0 else qty
-    safe_qty = math.floor(base_qty * 10) / 10
+    # Floor to 1 decimal place for SL to ensure qty ≤ actual filled position.
+    safe_qty = math.floor(qty * 10) / 10
     if safe_qty <= 0:
-        safe_qty = bingx_round_qty(base_qty)
+        safe_qty = bingx_round_qty(qty)
     data = _bingx_req("POST", "/openApi/swap/v2/trade/order", {
         "symbol": sym, "side": bx_side, "positionSide": pos_side,
         "type": "STOP_MARKET", "quantity": str(bingx_round_qty(safe_qty)),
@@ -1093,11 +1112,12 @@ def ex_place_market(ticker: str, side: str, qty: float,
     return bybit_place_market(ticker, side, qty, reduce_only)
 
 
-def ex_live_position_qty(ticker: str, direction: str, exchange: str) -> float | None:
-    if exchange != "bingx":
-        return None
-    pos_side = "LONG" if str(direction).upper() == "BUY" else "SHORT"
-    return bingx_live_position_qty(ticker, pos_side)
+def ex_live_position_qty(ticker: str, direction: str, exchange: str) -> float:
+    if exchange == "bingx":
+        return bingx_live_position_qty(ticker, direction)
+    if exchange == "bybit":
+        return bybit_live_position_qty(ticker, direction)
+    return 0.0
 
 
 def ex_place_stop(ticker: str, side: str, qty: float,
@@ -1958,16 +1978,20 @@ def handle_entry(payload: dict):
               f"tp4={tp4_price}")
 
     required_prices = {
-        "entry": price, "sl": sl_price,
-        "tp1": tp1_price, "tp2": tp2_price,
-        "tp3": tp3_price, "tp4": tp4_price,
+        "entry": price,
+        "sl": sl_price,
+        "tp1": tp1_price,
+        "tp2": tp2_price,
+        "tp3": tp3_price,
+        "tp4": tp4_price,
     }
-    missing_prices = [k for k, v in required_prices.items() if v is None or v <= 0]
-    if missing_prices:
+    missing_prices = [name for name, val in required_prices.items() if val is None or float(val or 0) <= 0]
+    if trade_mode == "trade" and missing_prices:
         write_log(f"ENTRY_REJECT_INVALID_CONTRACT | {ticker} {direction} | missing={missing_prices}")
         send_signals(
             f"⛔ <b>Вход отклонён {ticker} {direction}</b>\n"
-            f"Причина: неполный 4TP contract ({', '.join(missing_prices)}). Биржевой ордер не отправлен.",
+            f"Неполный контракт v153: отсутствует {', '.join(missing_prices)}.\n"
+            f"Биржевой вход не выполнен.",
             reply_to=source_msg_id,
         )
         return
@@ -2008,8 +2032,9 @@ def handle_entry(payload: dict):
 
         live_qty = ex_live_position_qty(ticker, direction, exchange)
         if live_qty and live_qty > 0:
-            qty = min(qty, live_qty)
-            write_log(f"ENTRY_QTY_SYNC | {ticker} {direction} [{exchange}] live_qty={live_qty} protected_qty={qty}")
+            old_qty = qty
+            qty = min(float(qty), float(live_qty))
+            write_log(f"ENTRY_QTY_SYNC | {ticker} {direction} [{exchange}] qty={old_qty} live={live_qty} used={qty}")
 
         sl_failed = False
         if sl_price:
@@ -2017,32 +2042,37 @@ def handle_entry(payload: dict):
                 resp = ex_place_stop(ticker, opp_side, qty, sl_price, exchange)
                 if exchange == "bybit" and resp.get("retCode") == 0:
                     sl_order_id = resp["result"].get("orderId", "")
+                elif exchange == "bybit":
+                    sl_failed = True
+                    write_log(f"SL_PLACE_ERR | {ticker} ({exchange}) | ret={resp.get('retCode')} msg={resp.get('retMsg')}")
                 elif exchange == "bingx":
                     sl_order_id = _bingx_order_id(resp) or "ok"
             except Exception as e:
                 sl_failed = True
                 write_log(f"SL_PLACE_ERR | {ticker} ({exchange}) | {e}")
+        else:
+            sl_failed = True
+            write_log(f"SL_PLACE_ERR | {ticker} ({exchange}) | missing sl_price")
 
         if sl_failed or not sl_order_id:
             emergency_unprotected = True
             close_qty = ex_live_position_qty(ticker, direction, exchange) or qty
-            write_log(f"ENTRY_ABORT_UNPROTECTED | {ticker} {direction} [{exchange}] | close_qty={close_qty}")
+            write_log(f"ENTRY_ABORT_UNPROTECTED | {ticker} {direction} [{exchange}] | close_qty={close_qty} sl_order_id={sl_order_id or '-'}")
             try:
                 ex_place_market(ticker, opp_side, close_qty, True, exchange)
                 send_signals(
-                    f"🛑 <b>{ticker} {direction}: SL не поставился</b>\n"
+                    f"🚨 <b>{ticker} {direction}: SL не поставился</b>\n"
                     f"Позиция закрыта reduce-only. TP не выставлялись.",
                     reply_to=source_msg_id,
                 )
-                return
             except Exception as e:
                 write_log(f"ENTRY_ABORT_CLOSE_ERR | {ticker} ({exchange}) | {e}")
                 send_signals(
-                    f"🚨 <b>КРИТИЧНО: {ticker} {direction} без SL</b>\n"
-                    f"SL не поставился, auto-close не удался: {e}\n"
-                    f"TP не выставлялись. Нужна ручная проверка биржи.",
+                    f"🚨 <b>КРИТИЧНО {ticker} {direction}</b>\n"
+                    f"SL не поставился, аварийное закрытие не удалось: {e}",
                     reply_to=source_msg_id,
                 )
+            return
 
         # ── Выставляем TP-ордера на биржу ──────────────────────────────────────
         _tp_map = {n: p for n, p in [
@@ -2122,11 +2152,11 @@ def handle_entry(payload: dict):
         "entry_price": price,
         "total_qty": qty,
         "remaining_qty": qty,
+        "emergency_unprotected": emergency_unprotected,
         "leverage": leverage,
         "notional_usdt": round(float(price or 0) * float(qty or 0), 8),
         "margin_usdt": round((float(price or 0) * float(qty or 0)) / leverage, 8) if leverage > 0 else None,
         "sl_price": sl_price,
-        "emergency_unprotected": emergency_unprotected,
     }
     dedup_entry(ticker, direction, current_key=key)
     if key:
@@ -2149,12 +2179,12 @@ def handle_entry(payload: dict):
             "entry_price": price,
             "total_qty": qty,
             "remaining_qty": qty,
+            "emergency_unprotected": emergency_unprotected,
             "leverage": leverage,
             "notional_usdt": round(float(price or 0) * float(qty or 0), 8),
             "margin_usdt": round((float(price or 0) * float(qty or 0)) / leverage, 8) if leverage > 0 else None,
             "sl_price": sl_price,
             "sl_order_id": sl_order_id,
-            "emergency_unprotected": emergency_unprotected,
             "tp1_price": tp1_price,
             "tp2_price": tp2_price,
             "tp3_price": tp3_price,
