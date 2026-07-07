@@ -1,0 +1,82 @@
+services:
+  - type: web
+    name: statham-bot
+    runtime: python
+    pythonVersion: "3.11.9"
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app -c gunicorn_config.py
+
+    envVars:
+      # ── Telegram ──────────────────────────────────────────────────
+      - key: TG_TOKEN
+        sync: false          # токен бота
+      - key: TG_CHAT
+        sync: false          # ID группы: -1003867089540
+      - key: TG_SIGNALS_TOPIC
+        value: "6314"        # ID ветки сигналов
+      - key: TG_SESSIONS_TOPIC
+        value: "6314"        # ID ветки сессий / F&G
+      - key: TG_TOPIC
+        value: "6314"
+
+      # ── Render ────────────────────────────────────────────────────
+      - key: RENDER_URL
+        sync: false          # https://statham-bot-dpvt.onrender.com
+      - key: RENDER_SECRET
+        sync: false          # защита /trades /positions /history /stats
+
+      # ── Bybit (РЕАЛЬНЫЕ ДЕНЬГИ) ───────────────────────────────────
+      - key: BYBIT_API_KEY
+        sync: false
+      - key: BYBIT_API_SECRET
+        sync: false
+      - key: TESTNET
+        value: "false"
+      # Все пары Bybit (крипто-фьючерсы perpetual):
+      - key: BYBIT_PAIRS
+        value: "EDGEUSDT,STOUSDT,FARTCOINUSDT,WLDUSDT,ZBTUSDT"
+
+      # ── BingX (ДЕМО) ──────────────────────────────────────────────
+      - key: BINGX_API_KEY
+        sync: false
+      - key: BINGX_API_SECRET
+        sync: false
+      - key: BINGX_DEMO
+        value: "true"
+      # Все пары BingX:
+      - key: BINGX_PAIRS
+        value: "ASTERUSDT,YBUSDT,UNIUSDT,SIRENUSDT,BLESSUSDT"
+
+      # ── Общий список (union Bybit + BingX) — для Telegram-only сигналов ──
+      - key: ALLOWED_PAIRS
+        value: "YBUSDT,ASTERUSDT,EDGEUSDT,STOUSDT,UNIUSDT,SIRENUSDT,FARTCOINUSDT,WLDUSDT,ZBTUSDT,BLESSUSDT"
+
+      # ── Администраторы (Telegram user_id) ────────────────────────
+      - key: ADMIN_USER_IDS
+        value: "7617558315"
+
+      # ── Торговля — глобальные дефолты ────────────────────────────
+      - key: DEFAULT_LEVERAGE
+        value: "20"
+      - key: DEFAULT_SIZE_USDT
+        value: "0.25"
+      - key: TRAIL_PCT
+        value: "0.5"
+
+      # ── Настройки по паре (JSON) ──────────────────────────────────
+      # Bybit: 10x / 1 USDT  |  BingX: 20x / 30 USDT  (дефолты в коде)
+      # Переопределения для конкретных пар:
+      - key: PAIR_SETTINGS_JSON
+        sync: false
+        # Пример (текущее значение):
+        # '{"EDGEUSDT":{"leverage":10,"size_usdt":20},"ASTERUSDT":{"leverage":10,"size_usdt":20},"STOUSDT":{"leverage":10,"size_usdt":20}}'
+
+      # ── Хранилище ─────────────────────────────────────────────────
+      - key: DATA_DIR
+        value: "/tmp"
+
+      # ── Upstash Redis (SSL, постоянное хранилище) ─────────────────
+      - key: REDIS_URL
+        sync: false
+        # Формат: rediss://default:PASSWORD@HOST.upstash.io:6379
+        # rediss:// (два s) = SSL — обязательно для Upstash
