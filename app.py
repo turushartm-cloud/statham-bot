@@ -50,6 +50,11 @@ Statham Trading Bot — RENDER (Unified v2.0)
 
   # ── Новые фильтры (v2.1) ────────────────────────────────────────────
   RENDER_SECRET       — секрет для /debug /trades /stats эндпоинтов
+
+  # ── Better Stack app-level logs (только этот bot, без workspace stream) ─────
+  BETTERSTACK_ENABLED      — "true" включает отправку structured logs
+  BETTERSTACK_SOURCE_TOKEN — Source token из Better Stack HTTP source
+  BETTERSTACK_INGEST_URL   — HTTPS ingest URL, например https://$INGESTING_HOST
 """
 
 from __future__ import annotations
@@ -104,6 +109,13 @@ BINGX_API_SECRET = os.environ.get("BINGX_API_SECRET", "")
 BINGX_DEMO       = os.environ.get("BINGX_DEMO", "false").lower() == "true"
 RENDER_SECRET    = (os.environ.get("RENDER_SECRET", "").strip()
                     or os.environ.get("DASHBOARD_SECRET", "").strip())
+
+# App-level Better Stack logger.  Disabled unless explicitly enabled via ENV.
+# Sends only statham-bot logs; avoids Render workspace-wide log stream noise.
+BETTERSTACK_ENABLED = os.environ.get("BETTERSTACK_ENABLED", "false").lower() == "true"
+BETTERSTACK_SOURCE_TOKEN = os.environ.get("BETTERSTACK_SOURCE_TOKEN", "").strip()
+BETTERSTACK_INGEST_URL = os.environ.get("BETTERSTACK_INGEST_URL", "").strip().rstrip("/")
+BETTERSTACK_TIMEOUT_SEC = float(os.environ.get("BETTERSTACK_TIMEOUT_SEC", "2"))
 
 BYBIT_AVAILABLE = BYBIT_LIB and bool(BYBIT_API_KEY) and bool(BYBIT_API_SECRET)
 BINGX_AVAILABLE = bool(BINGX_API_KEY) and bool(BINGX_API_SECRET)
@@ -432,10 +444,89 @@ def _rate_ok(ip: str) -> bool:
 # ══════════════════════════════════════════════════════════════════════════════
 # ЛОГИРОВАНИЕ
 # ══════════════════════════════════════════════════════════════════════════════
+_BS_EVENT_MAP = (
+    ("WEBHOOK |", "webhook_received"),
+    ("WEBHOOK_COMPAT |", "webhook_received"),
+    ("PARSED |", "entry_parsed"),
+    ("ENTRY |", "exchange_market_order"),
+    ("BYBIT_MARKET |", "exchange_market_order"),
+    ("BINGX_MARKET |", "exchange_market_order"),
+    ("BYBIT_STOP |", "sl_order_placed"),
+    ("BINGX_STOP |", "sl_order_placed"),
+    ("TP_ORDERS_PLACED |", "tp_orders_placed"),
+    ("TP_HIT_EXCHANGE |", "tp_hit"),
+    ("TP_REJECT |", "tp_reject"),
+    ("SL_MOVED |", "sl_moved"),
+    ("SL_HIT", "sl_hit"),
+    ("BINGX_API_ERR |", "exchange_error"),
+    ("BYBIT_", "exchange_event"),
+    ("SYNC_STATE |", "state_sync"),
+)
+
+
+def _redact_log_text(text: str) -> str:
+    text = re.sub(r"(?i)(secret=)[^&\s]+", r"\1***", str(text))
+    text = re.sub(r"(?i)(token=)[^&\s]+", r"\1***", text)
+    text = re.sub(r"(?i)(api[_-]?key=)[^&\s]+", r"\1***", text)
+    return text
+
+
+def _betterstack_event_name(entry: str) -> str:
+    for prefix, event_name in _BS_EVENT_MAP:
+        if entry.startswith(prefix):
+            return event_name
+    return "bot_log"
+
+
+def _extract_log_field(entry: str, name: str) -> str:
+    m = re.search(rf"\b{name}=([^\s|]+)", entry)
+    return m.group(1) if m else ""
+
+
+def _send_betterstack_log(payload: dict):
+    if not (BETTERSTACK_ENABLED and BETTERSTACK_SOURCE_TOKEN and BETTERSTACK_INGEST_URL):
+        return
+    try:
+        requests.post(
+            BETTERSTACK_INGEST_URL,
+            headers={
+                "Authorization": f"Bearer {BETTERSTACK_SOURCE_TOKEN}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=BETTERSTACK_TIMEOUT_SEC,
+        )
+    except Exception:
+        # Logging must never block or break trading.
+        pass
+
+
+def _emit_betterstack_log(entry: str, ts_iso: str):
+    if not (BETTERSTACK_ENABLED and BETTERSTACK_SOURCE_TOKEN and BETTERSTACK_INGEST_URL):
+        return
+    safe_entry = _redact_log_text(entry)
+    event_name = _betterstack_event_name(safe_entry)
+    payload = {
+        "dt": ts_iso,
+        "service": "statham-bot",
+        "environment": os.environ.get("RENDER_SERVICE_NAME", "render"),
+        "event": event_name,
+        "message": safe_entry,
+        "strategy_version": STRATEGY_VERSION,
+        "schema_version": SCHEMA_VERSION,
+        "tp_contract": TP_CONTRACT,
+        "ticker": _extract_log_field(safe_entry, "ticker"),
+        "trade_id": _extract_log_field(safe_entry, "trade_id"),
+    }
+    threading.Thread(target=_send_betterstack_log, args=(payload,), daemon=True).start()
+
+
 def write_log(entry: str):
-    ts   = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    now  = datetime.datetime.utcnow()
+    ts   = now.strftime("%Y-%m-%d %H:%M:%S UTC")
     line = f"[{ts}] {entry}\n"
     log.info(entry)
+    _emit_betterstack_log(entry, now.isoformat(timespec="milliseconds") + "Z")
     try:
         with _file_lock:
             with open(LOG_FILE, "a", encoding="utf-8") as f:
