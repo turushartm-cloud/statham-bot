@@ -115,6 +115,8 @@ RENDER_SECRET    = (os.environ.get("RENDER_SECRET", "").strip()
 BETTERSTACK_ENABLED = os.environ.get("BETTERSTACK_ENABLED", "false").lower() == "true"
 BETTERSTACK_SOURCE_TOKEN = os.environ.get("BETTERSTACK_SOURCE_TOKEN", "").strip()
 BETTERSTACK_INGEST_URL = os.environ.get("BETTERSTACK_INGEST_URL", "").strip().rstrip("/")
+if BETTERSTACK_INGEST_URL and not BETTERSTACK_INGEST_URL.startswith(("http://", "https://")):
+    BETTERSTACK_INGEST_URL = "https://" + BETTERSTACK_INGEST_URL
 BETTERSTACK_TIMEOUT_SEC = float(os.environ.get("BETTERSTACK_TIMEOUT_SEC", "2"))
 
 BYBIT_AVAILABLE = BYBIT_LIB and bool(BYBIT_API_KEY) and bool(BYBIT_API_SECRET)
