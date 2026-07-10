@@ -14,10 +14,11 @@ Environment variables:
 """
 
 from __future__ import annotations
-import json, os, time, math, io, csv
+import json, os, time, math, io, csv, re, threading, logging
 from datetime import datetime, timezone, timedelta
 from functools import wraps
 from flask import Flask, request, jsonify, Response, abort
+import requests
 
 # ── Redis ──────────────────────────────────────────────────────────────────────
 try:
@@ -27,16 +28,80 @@ except ImportError:
     _REDIS_AVAILABLE = False
 
 app = Flask(__name__)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger(__name__)
 
 REDIS_URL          = os.environ.get("REDIS_URL", "").strip()
 DASHBOARD_SECRET   = os.environ.get("DASHBOARD_SECRET", "").strip()
 TG_TOKEN           = os.environ.get("TG_TOKEN", "").strip()
 TG_ADMIN_ID        = os.environ.get("TG_ADMIN_ID", "").strip()
 PNL_ALERT_THRESHOLD = float(os.environ.get("PNL_ALERT_THRESHOLD", "-5.0"))
+BETTERSTACK_ENABLED = os.environ.get("BETTERSTACK_ENABLED", "false").lower() == "true"
+BETTERSTACK_SOURCE_TOKEN = os.environ.get("BETTERSTACK_SOURCE_TOKEN", "").strip()
+BETTERSTACK_INGEST_URL = os.environ.get("BETTERSTACK_INGEST_URL", "").strip().rstrip("/")
+if BETTERSTACK_INGEST_URL and not BETTERSTACK_INGEST_URL.startswith(("http://", "https://")):
+    BETTERSTACK_INGEST_URL = "https://" + BETTERSTACK_INGEST_URL
+BETTERSTACK_TIMEOUT_SEC = float(os.environ.get("BETTERSTACK_TIMEOUT_SEC", "2"))
 _REDIS_PREFIX      = "statham:"
 
 _redis_client = None
 MSK_TZ = timezone(timedelta(hours=3))
+
+
+# ── Better Stack app-level logs ────────────────────────────────────────────────
+def _redact_log_text(text: str) -> str:
+    text = re.sub(r"(?i)(secret=)[^&\s]+", r"\1***", str(text))
+    text = re.sub(r"(?i)(token=)[^&\s]+", r"\1***", text)
+    text = re.sub(r"(?i)(api[_-]?key=)[^&\s]+", r"\1***", text)
+    return text
+
+def _send_betterstack(payload: dict):
+    if not (BETTERSTACK_ENABLED and BETTERSTACK_SOURCE_TOKEN and BETTERSTACK_INGEST_URL):
+        return
+    try:
+        requests.post(
+            BETTERSTACK_INGEST_URL,
+            headers={
+                "Authorization": f"Bearer {BETTERSTACK_SOURCE_TOKEN}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=BETTERSTACK_TIMEOUT_SEC,
+        )
+    except Exception:
+        pass
+
+def dash_log(event: str, **fields):
+    safe_fields = {}
+    for key, value in fields.items():
+        if isinstance(value, str):
+            safe_fields[key] = _redact_log_text(value)
+        else:
+            safe_fields[key] = value
+    payload = {
+        "dt": datetime.utcnow().isoformat(timespec="milliseconds") + "Z",
+        "service": "statham-dashboard",
+        "environment": os.environ.get("RENDER_SERVICE_NAME", "render"),
+        "event": event,
+        **safe_fields,
+    }
+    log.info("%s | %s", event, safe_fields)
+    if BETTERSTACK_ENABLED:
+        threading.Thread(target=_send_betterstack, args=(payload,), daemon=True).start()
+
+@app.after_request
+def _dashboard_request_log(response):
+    if request.path.startswith(("/api/", "/stats", "/positions", "/history")):
+        dash_log(
+            "dashboard_request",
+            path=request.path,
+            status=response.status_code,
+            period=request.args.get("period", ""),
+            direction=request.args.get("direction", ""),
+            strategy_version=request.args.get("strategy_version", ""),
+            quality_gate=request.args.get("quality_gate", ""),
+        )
+    return response
 
 def _get_redis():
     global _redis_client
@@ -67,7 +132,8 @@ def redis_get(key: str):
     try:
         val = r.get(_REDIS_PREFIX + key)
         return json.loads(val) if val else None
-    except Exception:
+    except Exception as e:
+        dash_log("redis_error", key=key, error=f"{type(e).__name__}: {e}")
         return None
 
 # ── Auth ───────────────────────────────────────────────────────────────────────
@@ -348,6 +414,30 @@ def api_stats():
     cohort = _filter_history(history, period, direction, strategy_version, entry_mode, False)
     filtered = _filter_history(history, period, direction, strategy_version, entry_mode, quality_gate)
     stats = _calc_stats(filtered)
+    q = stats.get("quality", {})
+    if any(int(q.get(k, 0) or 0) for k in ("pnl_missing", "negative_partials", "positive_losses", "legacy_tp_above_4", "tp_summary_disagreements", "duplicate_terminal_events")):
+        dash_log(
+            "quality_flags",
+            period=period,
+            direction=direction,
+            strategy_version=strategy_version or "ALL",
+            pnl_missing=q.get("pnl_missing", 0),
+            negative_partials=q.get("negative_partials", 0),
+            positive_losses=q.get("positive_losses", 0),
+            legacy_tp_above_4=q.get("legacy_tp_above_4", 0),
+            tp_summary_disagreements=q.get("tp_summary_disagreements", 0),
+            duplicate_terminal_events=q.get("duplicate_terminal_events", 0),
+        )
+    dash_log(
+        "dashboard_stats",
+        period=period,
+        direction=direction,
+        strategy_version=strategy_version or "ALL",
+        total=stats.get("total", 0),
+        pnl_sum_pct=stats.get("pnl_sum_pct", 0),
+        win_rate=stats.get("win_rate", 0),
+        open_total=len(_position_items(redis_get("positions") or {})),
+    )
     if quality_gate:
         # Headline metrics use clean records, but the warning strip must still
         # expose excluded corrupt records instead of manufacturing quality=0.
@@ -430,6 +520,7 @@ def api_positions():
         })
     # Sort: BUY first, then SELL, then by created_at desc
     result.sort(key=lambda x: (x["direction"] != "BUY", -(x.get("created_at") or 0)))
+    dash_log("dashboard_positions", count=len(result), legacy=sum(1 for x in result if x.get("strategy_version") == "legacy"))
     return jsonify({"positions": result})
 
 @app.route("/api/history")
@@ -510,6 +601,7 @@ def api_history():
             "strategy": r.get("strategy"),
         })
 
+    dash_log("dashboard_history", total=total, page=page, per_page=per_page, period=period, direction=direction, strategy_version=strategy_version or "ALL")
     return jsonify({"rows": rows, "total": total, "page": page, "per_page": per_page})
 
 @app.route("/api/export")
@@ -572,7 +664,14 @@ def api_export():
 
 @app.route("/health")
 def health():
-    return jsonify({"ok": True, "redis": _get_redis() is not None})
+    return jsonify({
+        "ok": True,
+        "redis": _get_redis() is not None,
+        "betterstack": {
+            "enabled": BETTERSTACK_ENABLED,
+            "configured": bool(BETTERSTACK_SOURCE_TOKEN and BETTERSTACK_INGEST_URL),
+        },
+    })
 
 @app.route("/")
 def index():

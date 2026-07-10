@@ -2751,10 +2751,13 @@ def process_signal(payload: dict):
     text = payload.get("text", "").strip()
     key  = build_trade_key(payload)
 
-    if event in ("entry", "smart_entry"):
+    if event == "entry":
         handle_entry(payload)
     elif event == "limit_hit":
         handle_entry(payload)
+    elif event == "smart_entry":
+        write_log(f"SMART_ENTRY_TELEGRAM_ONLY | ticker={payload.get('ticker','?')} direction={payload.get('direction','?')}")
+        send_signals(text or f"🎯 SMART ENTRY {payload.get('direction','')} | #{payload.get('ticker','')}")
     elif event == "limit_order":
         send_signals(text or f"📋 Лимитный ордер {payload.get('ticker','')}")
     elif event == "tp_hit":
@@ -4228,6 +4231,10 @@ def health():
         "bybit_pairs":   sorted(BYBIT_PAIRS),
         "bingx_pairs":   sorted(BINGX_PAIRS),
         "time_msk":      _msk().strftime("%Y-%m-%d %H:%M"),
+        "betterstack": {
+            "enabled": BETTERSTACK_ENABLED,
+            "configured": bool(BETTERSTACK_SOURCE_TOKEN and BETTERSTACK_INGEST_URL),
+        },
     })
 
 
@@ -4273,7 +4280,7 @@ def bybit_webhook():
     # Все алерты принимаем: торговые пары торгуются, остальные идут только в Telegram.
     ticker = payload.get("ticker", "").upper().replace(".P", "")
     event  = payload.get("event", "")
-    if event in ("entry", "smart_entry", "limit_hit") and ticker:
+    if event in ("entry", "limit_hit") and ticker:
         if ALLOWED_PAIRS and ticker not in ALLOWED_PAIRS:
             write_log(f"WEBHOOK_TELEGRAM_ONLY | {ticker} not in ALLOWED_PAIRS={sorted(ALLOWED_PAIRS)} — signal → Telegram only, no exchange execution")
 
