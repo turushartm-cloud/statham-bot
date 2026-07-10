@@ -1068,9 +1068,35 @@ def _bingx_audit_export(days: int = 30, limit: int = 1000) -> dict:
     limit = max(1, min(int(limit), 1000))
     now_ms = int(time.time() * 1000)
     params = {"startTime": now_ms - days * 86400000, "endTime": now_ms, "limit": limit}
+    history_all = load_history()
+    closed_all = load_closed_trades()
+    sent_flags = load_json(SENT_FLAGS_FILE, {})
+    try:
+        with open(LOG_FILE, "r", encoding="utf-8") as f:
+            logs_tail = f.readlines()[-min(limit, 1000):]
+    except Exception as exc:
+        logs_tail = []
     result = {
         "generated_at": int(time.time()),
         "range_days": days,
+        "limit": limit,
+        "audit_contract": {
+            "strategy_version": STRATEGY_VERSION,
+            "schema_version": SCHEMA_VERSION,
+            "tp_contract": TP_CONTRACT,
+            "read_only": True,
+        },
+        "bot_state": {
+            "active_trades": load_trades(),
+            "positions": load_positions(),
+            "history_records": len(history_all),
+            "history_tail": history_all[-limit:],
+            "closed_trades_count": len(closed_all) if isinstance(closed_all, dict) else 0,
+            "closed_trades_tail": dict(list(closed_all.items())[-limit:]) if isinstance(closed_all, dict) else closed_all,
+            "sent_flags_count": len(sent_flags) if isinstance(sent_flags, dict) else 0,
+            "stats": load_stats(),
+        },
+        "logs_tail": logs_tail,
         "equity_history": load_json(EQUITY_HISTORY_FILE, []),
         "balance": None,
         "fills": [],
@@ -4180,6 +4206,8 @@ def bybit_webhook_compat(secret: str):
 
 @app.route("/setup")
 def setup():
+    if not _http_auth(request):
+        return jsonify({"error": "forbidden"}), 403
     return jsonify({"webhook_registered": register_webhook()})
 
 
@@ -4298,6 +4326,8 @@ def test_bingx_route():
 @app.route("/diagnostics")
 def diagnostics_route():
     """Проверяет связь с Telegram, Bybit, BingX, Redis."""
+    if not _http_auth(request):
+        return jsonify({"error": "forbidden"}), 403
     result = {"time_utc": datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")}
 
     # Telegram
@@ -4350,6 +4380,8 @@ def diagnostics_route():
 
 @app.route("/redis_status")
 def redis_status_route():
+    if not _http_auth(request):
+        return jsonify({"error": "forbidden"}), 403
     r = _get_redis()
     if r is None:
         return jsonify({"redis": "not configured", "REDIS_URL_set": bool(os.environ.get("REDIS_URL"))}), 200
