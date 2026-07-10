@@ -142,12 +142,11 @@ def _parse_pairs(env_key: str) -> set[str]:
             if p.strip() and p.strip().upper() not in ("NONE", "NULL", "-")}
 
 
-# Пустой BYBIT_PAIRS  → Bybit не торгует ничем
-# Пустой BINGX_PAIRS  → BingX не торгует ничем
+# Legacy ENV only: no longer gates trading. All valid webhook entries are eligible.
 BYBIT_PAIRS   = _parse_pairs("BYBIT_PAIRS")
 BINGX_PAIRS   = _parse_pairs("BINGX_PAIRS")
-# ALLOWED_PAIRS = объединение для фильтрации входящих сигналов на наличие пары
-ALLOWED_PAIRS = BYBIT_PAIRS | BINGX_PAIRS
+ALLOWED_PAIRS = set()
+PAIR_GATE_ENABLED = False
 
 # DEFAULT_LEVERAGE должен быть одним числом, например "10"
 # Используй PAIR_SETTINGS_JSON для разных плечей на разные пары
@@ -210,7 +209,7 @@ def _parse_pair_settings(raw: str) -> dict:
     log.error(f"PAIR_SETTINGS_JSON | all parse attempts failed, using empty dict. Raw: {raw[:200]}")
     return {}
 
-PAIR_SETTINGS: dict = _parse_pair_settings(os.environ.get("PAIR_SETTINGS_JSON", "{}"))
+PAIR_SETTINGS: dict = {}  # PAIR_SETTINGS_JSON deprecated: use DEFAULT_LEVERAGE / DEFAULT_SIZE_USDT only.
 
 # TP_CLOSE_PCT: распределение частичных закрытий по уровням TP
 # ✅ EDGE-FIX: 4 TP, «прибыль течёт» — только 45% выходит у входа (TP1+TP2),
@@ -374,15 +373,9 @@ def _startup_warnings():
     if not TESTNET and (BYBIT_AVAILABLE or BINGX_AVAILABLE):
         log.warning("LIVE TRADING ACTIVE! TESTNET=false — торговля реальными деньгами!")
     if BYBIT_AVAILABLE:
-        if BYBIT_PAIRS:
-            log.info(f"Bybit ACTIVE | testnet={TESTNET} | pairs={sorted(BYBIT_PAIRS)}")
-        else:
-            log.warning("Bybit IDLE — BYBIT_PAIRS пустой, торговля отключена (только Telegram-сигналы)")
+        log.info(f"Bybit AVAILABLE | testnet={TESTNET} | pair gate disabled")
     if BINGX_AVAILABLE:
-        if BINGX_PAIRS:
-            log.info(f"BingX ACTIVE | demo={BINGX_DEMO} | pairs={sorted(BINGX_PAIRS)}")
-        else:
-            log.warning("BingX IDLE — BINGX_PAIRS пустой, торговля отключена (только Telegram-сигналы)")
+        log.info(f"BingX AVAILABLE | demo={BINGX_DEMO} | pair gate disabled")
 
     # ── Redis — обязательное хранилище ───────────────────────────────────
     redis_url = os.environ.get("REDIS_URL", "").strip()
@@ -653,11 +646,10 @@ def is_admin_user(user_id: int) -> bool:
 
 
 def get_exchange_for(ticker: str) -> str:
-    """Возвращает 'bybit', 'bingx' или 'none'."""
-    t = ticker.upper().replace(".P", "")
-    if t in BINGX_PAIRS and BINGX_AVAILABLE:
+    """All webhook entries trade if exchange credentials exist. Preference: BingX → Bybit."""
+    if BINGX_AVAILABLE:
         return "bingx"
-    if t in BYBIT_PAIRS and BYBIT_AVAILABLE:
+    if BYBIT_AVAILABLE:
         return "bybit"
     return "none"
 
@@ -2026,12 +2018,10 @@ def handle_entry(payload: dict):
     side = "Buy" if direction == "BUY" else "Sell"
     opp_side = "Sell" if side == "Buy" else "Buy"
 
-    # Дефолты берутся из ENV: DEFAULT_LEVERAGE / DEFAULT_SIZE_USDT (без хардкода).
-    # PAIR_SETTINGS_JSON по-прежнему перекрывает их для конкретной пары.
-    ex_def = {"leverage": DEFAULT_LEVERAGE, "size_usdt": DEFAULT_SIZE_USDT}
-    cfg = {**ex_def, **PAIR_SETTINGS.get(ticker, {})}
-    leverage  = int(cfg["leverage"])
-    size_usdt = float(cfg["size_usdt"])
+    # Дефолты берутся из ENV: DEFAULT_LEVERAGE / DEFAULT_SIZE_USDT.
+    # PAIR_SETTINGS_JSON deprecated: no pair-specific overrides.
+    leverage  = int(DEFAULT_LEVERAGE)
+    size_usdt = float(DEFAULT_SIZE_USDT)
 
     # Risk gate: leverage cannot repair a negative edge.  Cap all new entries
     # at 10x and volatile entries (ATR >= 1.5%) at 5x. Pair overrides may lower
@@ -2478,6 +2468,7 @@ def handle_sl_hit(payload: dict):
             instance_id = _trade_instance_id(trade_key or key, trade, None, payload)
             if _trade_already_closed(instance_id):
                 write_log(f"SL_DUPLICATE_SKIP | {ticker} | already closed")
+                return
             _found_pos_sl = False
         else:
             exchange = pos.get("exchange", "bybit")
@@ -2756,8 +2747,8 @@ def process_signal(payload: dict):
     elif event == "limit_hit":
         handle_entry(payload)
     elif event == "smart_entry":
-        write_log(f"SMART_ENTRY_TELEGRAM_ONLY | ticker={payload.get('ticker','?')} direction={payload.get('direction','?')}")
-        send_signals(text or f"🎯 SMART ENTRY {payload.get('direction','')} | #{payload.get('ticker','')}")
+        write_log(f"SMART_ENTRY_IGNORED | ticker={payload.get('ticker','?')} direction={payload.get('direction','?')} reason=no_trade_contract")
+        return
     elif event == "limit_order":
         send_signals(text or f"📋 Лимитный ордер {payload.get('ticker','')}")
     elif event == "tp_hit":
@@ -3733,21 +3724,17 @@ if bot:
         # Bybit статус
         if not BYBIT_AVAILABLE:
             bybit_status = "❌ не настроен (нет API ключей)"
-        elif not BYBIT_PAIRS:
-            bybit_status = "⏸ IDLE (BYBIT_PAIRS пустой — торговля выключена)"
         else:
-            bybit_status = "🧪 TESTNET" if TESTNET else "🔴 LIVE"
+            bybit_status = "🧪 TESTNET / all webhook pairs" if TESTNET else "🔴 LIVE / all webhook pairs"
         # BingX статус
         if not BINGX_AVAILABLE:
             bingx_status = "❌ не настроен (нет API ключей)"
-        elif not BINGX_PAIRS:
-            bingx_status = "⏸ IDLE (BINGX_PAIRS пустой — торговля выключена)"
         else:
-            bingx_status = "🧪 DEMO" if BINGX_DEMO else "🔴 LIVE"
+            bingx_status = "🧪 DEMO / all webhook pairs" if BINGX_DEMO else "🔴 LIVE / all webhook pairs"
 
-        bybit_pairs_str = ", ".join(sorted(BYBIT_PAIRS)) if BYBIT_PAIRS else "— (пусто)"
-        bingx_pairs_str = ", ".join(sorted(BINGX_PAIRS)) if BINGX_PAIRS else "— (пусто)"
-        ps_str = ", ".join(sorted(PAIR_SETTINGS.keys())) if PAIR_SETTINGS else "— (пусто или ошибка JSON)"
+        bybit_pairs_str = "ALL webhook pairs (BYBIT_PAIRS ignored)"
+        bingx_pairs_str = "ALL webhook pairs (BINGX_PAIRS ignored)"
+        ps_str = "ignored/deprecated; use DEFAULT_LEVERAGE + DEFAULT_SIZE_USDT"
 
         _reply(m, (
             f"💱 <b>Биржи и пары</b>\n\n"
@@ -4228,8 +4215,10 @@ def health():
         "active_trades": len(load_trades()),
         "positions":     len(load_positions()),
         "emergency":     _emergency_stop.is_set(),
-        "bybit_pairs":   sorted(BYBIT_PAIRS),
-        "bingx_pairs":   sorted(BINGX_PAIRS),
+        "pair_gate":     "disabled",
+        "execution_preference": "bingx" if BINGX_AVAILABLE else ("bybit" if BYBIT_AVAILABLE else "none"),
+        "bybit_pairs":   "ignored",
+        "bingx_pairs":   "ignored",
         "time_msk":      _msk().strftime("%Y-%m-%d %H:%M"),
         "betterstack": {
             "enabled": BETTERSTACK_ENABLED,
@@ -4277,13 +4266,7 @@ def bybit_webhook():
 
     # Проверка WEBHOOK_SECRET отключена — принимаем все POST запросы
 
-    # Все алерты принимаем: торговые пары торгуются, остальные идут только в Telegram.
-    ticker = payload.get("ticker", "").upper().replace(".P", "")
-    event  = payload.get("event", "")
-    if event in ("entry", "limit_hit") and ticker:
-        if ALLOWED_PAIRS and ticker not in ALLOWED_PAIRS:
-            write_log(f"WEBHOOK_TELEGRAM_ONLY | {ticker} not in ALLOWED_PAIRS={sorted(ALLOWED_PAIRS)} — signal → Telegram only, no exchange execution")
-
+    # Pair gate disabled: every valid entry/limit_hit webhook is eligible for exchange execution.
     write_log(f"WEBHOOK | event={payload.get('event','?')} ticker={payload.get('ticker','?')}")
     enqueue_signal(payload)
     return jsonify({"status": "queued", "event": payload.get("event","?")}), 200
