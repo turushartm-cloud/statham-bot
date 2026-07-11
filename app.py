@@ -516,6 +516,32 @@ def _emit_betterstack_log(entry: str, ts_iso: str):
     threading.Thread(target=_send_betterstack_log, args=(payload,), daemon=True).start()
 
 
+def log_event(event: str, **fields):
+    """Structured Better Stack event. Must never break trading path."""
+    if not (BETTERSTACK_ENABLED and BETTERSTACK_SOURCE_TOKEN and BETTERSTACK_INGEST_URL):
+        return
+    try:
+        now = datetime.datetime.utcnow()
+        safe_fields = {}
+        for key, value in fields.items():
+            if value is None:
+                continue
+            safe_fields[str(key)] = _redact_log_text(value) if isinstance(value, str) else value
+        payload = {
+            "dt": now.isoformat(timespec="milliseconds") + "Z",
+            "service": "statham-bot",
+            "environment": os.environ.get("RENDER_SERVICE_NAME", "render"),
+            "event": str(event or "bot_event"),
+            "strategy_version": STRATEGY_VERSION,
+            "schema_version": SCHEMA_VERSION,
+            "tp_contract": TP_CONTRACT,
+            **safe_fields,
+        }
+        threading.Thread(target=_send_betterstack_log, args=(payload,), daemon=True).start()
+    except Exception:
+        pass
+
+
 def write_log(entry: str):
     now  = datetime.datetime.utcnow()
     ts   = now.strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -3469,7 +3495,35 @@ def _position_manager():
                 if exchange == "none":
                     continue
 
-                # Trail управляется индикатором через sl_moved. Bot trail отключён.
+                # Safety guard: если TP2/TP3 уже достигнуты, но TradingView sl_moved
+                # не пришёл/не сохранился, bot сам переносит SL по конфигу BE/TRAIL.
+                # Это чинит активные сделки, которые уже имеют tp2_hit/tp3_hit.
+                highest_tp = _highest_tp_hit(pos)
+                needs_be = highest_tp >= 2 and _truthy(pos.get("config_be_tp2")) and not _truthy(pos.get("be_active"))
+                needs_trail = highest_tp >= 3 and _truthy(pos.get("config_trail_tp3")) and not _truthy(pos.get("trail_active"))
+                if needs_be or needs_trail:
+                    applied, _oid = _apply_bot_sl_fallback(pos, highest_tp)
+                    if applied:
+                        with _pos_lock:
+                            p2 = load_positions()
+                            if pkey in p2:
+                                p2[pkey].update(pos)
+                                save_positions(p2)
+                        if pos.get("trade_key"):
+                            touch_trade(
+                                pos.get("trade_key"),
+                                sl_price=pos.get("sl_price"),
+                                sl_order_id=pos.get("sl_order_id", ""),
+                                be_active=bool(pos.get("be_active", False)),
+                                trail_active=bool(pos.get("trail_active", False)),
+                                trail_sl=pos.get("trail_sl"),
+                                sl_moved_count=int(pos.get("sl_moved_count") or 0),
+                                last_sl_move_reason=pos.get("last_sl_move_reason", ""),
+                                last_sl_moved_at=pos.get("last_sl_moved_at"),
+                            )
+                        continue
+
+                # Legacy percentage trail. Default disabled; TP2/TP3 fallback above remains active.
                 if not pos.get("trail_active") or TRAIL_PCT == 0.0:
                     continue
                 ticker   = pos["symbol"]
