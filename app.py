@@ -1883,6 +1883,42 @@ def remove_trade(key: str):
             save_trades(t)
 
 
+def _remove_trades_for_phantom_positions(phantom_positions: list[dict], reason: str = "sync_phantom") -> int:
+    """Remove active trade records whose exchange position was proven absent.
+
+    Sync previously deleted only positions, leaving stale trades like APEX/XMR.
+    Match by trade_key/trade_id first, then ticker+direction fallback.
+    """
+    if not phantom_positions:
+        return 0
+    with _state_lock:
+        trades = load_trades()
+        remove_keys = set()
+        for pos in phantom_positions:
+            ticker = str(pos.get("symbol") or pos.get("ticker") or "").upper().replace(".P", "")
+            direction = str(pos.get("direction") or "").upper()
+            trade_key = str(pos.get("trade_key") or "").strip()
+            trade_id = str(pos.get("trade_id") or "").strip()
+            if trade_key and trade_key in trades:
+                remove_keys.add(trade_key)
+            if trade_id and trade_id in trades:
+                remove_keys.add(trade_id)
+            if ticker and direction:
+                for k, t in trades.items():
+                    if not isinstance(t, dict):
+                        continue
+                    tk = str(t.get("ticker") or t.get("symbol") or "").upper().replace(".P", "")
+                    dr = str(t.get("direction") or "").upper()
+                    if tk == ticker and dr == direction:
+                        remove_keys.add(k)
+        for k in remove_keys:
+            trades.pop(k, None)
+        if remove_keys:
+            save_trades(trades)
+            write_log(f"SYNC_TRADE_CLEANUP | removed {len(remove_keys)} trades after {reason}: {sorted(remove_keys)[:10]}")
+        return len(remove_keys)
+
+
 # ✅ IMPROVEMENT #2: Redis dedup — 60-сек TTL на входящий алерт
 def _alert_dedup_check(trade_id: str, event: str, ticker: str, timeframe: str) -> bool:
     """Возвращает True если алерт — дубль (нужно игнорировать).
@@ -1939,6 +1975,13 @@ def cleanup_old_trades() -> int:
             if tk:
                 pos_keys_set.add(tk)
 
+        live_pairs = {
+            (str(pos.get("symbol") or pos.get("ticker") or "").upper().replace(".P", ""),
+             str(pos.get("direction") or "").upper())
+            for pos in positions.values() if isinstance(pos, dict)
+        }
+        cutoff_exchange_orphan = now - 15 * 60
+
         removed = []
         for k, v in list(trades.items()):
             created = int(v.get("created_at") or 0)
@@ -1946,6 +1989,14 @@ def cleanup_old_trades() -> int:
             if k in pos_keys_set:
                 continue
             if created < cutoff_old:
+                removed.append(k)
+                continue
+            ticker = str(v.get("ticker") or v.get("symbol") or "").upper().replace(".P", "")
+            direction = str(v.get("direction") or "").upper()
+            exchange = str(v.get("exchange") or "none").lower()
+            # Exchange orphan: live trade record exists, but matching active position is gone.
+            # Keep short grace window to avoid entry-save race, then clean.
+            if exchange != "none" and ticker and direction and (ticker, direction) not in live_pairs and created < cutoff_exchange_orphan:
                 removed.append(k)
                 continue
             # Orphan: trade без активной позиции, висит > 2ч
@@ -2635,10 +2686,21 @@ def handle_sl_moved(payload: dict):
         write_log(f"SL_MOVED_REJECT | {ticker} | missing/invalid new_sl")
         return
     pkey = pos_key(ticker, direction)
+    payload_trade_id = str(payload.get("trade_id") or "").strip()
     with _pos_lock:
         positions = load_positions()
         pos = positions.get(pkey)
         if not pos:
+            write_log(f"SL_MOVED_ORPHAN_SKIP | {ticker} {direction} | no active position")
+            log_event("sl_moved_orphan_skip", ticker=ticker, direction=direction, trade_id=payload_trade_id, reason="no_active_position")
+            return
+        pos_trade_id = str(pos.get("trade_id") or "").strip()
+        pos_trade_key = str(pos.get("trade_key") or "").strip()
+        exact_match = (trade_key and pos_trade_key and trade_key == pos_trade_key) or (payload_trade_id and pos_trade_id and payload_trade_id == pos_trade_id)
+        legacy_no_id = not payload_trade_id and not trade_key
+        if not exact_match and not legacy_no_id:
+            write_log(f"SL_MOVED_STALE_SKIP | {ticker} {direction} | payload_trade_id={payload_trade_id or '-'} pos_trade_id={pos_trade_id or '-'}")
+            log_event("sl_moved_stale_skip", ticker=ticker, direction=direction, trade_id=payload_trade_id, pos_trade_id=pos_trade_id)
             return
         reply_id = (trade or {}).get("message_id") or pos.get("message_id")
         send_signals(text or f"🔒 SL сдвинут {ticker}", reply_to=reply_id)
@@ -2660,6 +2722,9 @@ def handle_sl_moved(payload: dict):
             pos["trail_sl"] = new_sl
         pos["sl_price"]    = new_sl
         pos["sl_order_id"] = oid
+        pos["sl_moved_count"] = int(pos.get("sl_moved_count") or 0) + 1
+        pos["last_sl_move_reason"] = reason[:160]
+        pos["last_sl_moved_at"] = int(time.time())
         positions[pkey] = pos
         save_positions(positions)
     if trade_key:
@@ -2668,7 +2733,16 @@ def handle_sl_moved(payload: dict):
             sl_price=new_sl,
             be_active=bool(pos.get("be_active", False)),
             trail_active=bool(pos.get("trail_active", False)),
+            sl_moved_count=int(pos.get("sl_moved_count") or 0),
+            last_sl_move_reason=pos.get("last_sl_move_reason", ""),
+            last_sl_moved_at=pos.get("last_sl_moved_at"),
         )
+    log_event(
+        "sl_moved_applied",
+        ticker=ticker, direction=direction, trade_id=payload_trade_id, new_sl=new_sl,
+        be_active=bool(pos.get("be_active", False)), trail_active=bool(pos.get("trail_active", False)),
+        sl_moved_count=int(pos.get("sl_moved_count") or 0), exchange=pos.get("exchange", "none"), order_id=oid,
+    )
 
 
 def close_position_manually(pos: dict, source: str) -> tuple[bool, str]:
@@ -3127,6 +3201,9 @@ def _recover_missing_trade_records() -> int:
             "amd_phase": pos.get("amd_phase", ""),
             "be_active": bool(pos.get("be_active", False)),
             "trail_active": bool(pos.get("trail_active", False)),
+            "sl_moved_count": int(pos.get("sl_moved_count") or 0),
+            "last_sl_move_reason": pos.get("last_sl_move_reason", ""),
+            "last_sl_moved_at": pos.get("last_sl_moved_at"),
             "state_recovered": True,
             "recovered_at": now,
         }
@@ -3179,11 +3256,13 @@ def _sync_exchange_positions():
                 and pos.get("exchange") != "none"
             ]
             if phantoms:
+                phantom_positions = [bybit_tracked.get(pkey, {}) for pkey in phantoms]
                 with _pos_lock:
                     p2 = load_positions()
                     for pkey in phantoms:
                         p2.pop(pkey, None)
                     save_positions(p2)
+                _remove_trades_for_phantom_positions(phantom_positions, "sync_bybit_phantom")
                 _phantom_list = "\n".join(f"• {pk}" for pk in phantoms)
                 send_signals(
                     f"🔄 <b>Синхронизация Bybit</b>\n"
@@ -3215,11 +3294,13 @@ def _sync_exchange_positions():
                  str(pos.get("direction") or "").upper()) not in live_bingx
             ]
             if phantoms_bx:
+                phantom_positions = [bingx_tracked.get(pkey, {}) for pkey in phantoms_bx]
                 with _pos_lock:
                     p2 = load_positions()
                     for pkey in phantoms_bx:
                         p2.pop(pkey, None)
                     save_positions(p2)
+                _remove_trades_for_phantom_positions(phantom_positions, "sync_bingx_phantom")
                 write_log(f"SYNC_BINGX | removed {len(phantoms_bx)} phantoms: {phantoms_bx}")
         except Exception as e:
             write_log(f"SYNC_BINGX_ERR | {e}")
