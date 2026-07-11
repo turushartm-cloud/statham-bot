@@ -4036,7 +4036,7 @@ if bot:
         )
         _reply(m, "\n".join(lines))
 
-    @bot.message_handler(commands=["active"])
+    @bot.message_handler(commands=["active", "trades", "positions"])
     def cmd_active(m):
         if not is_admin_user(m.from_user.id):
             _reply(m, "⛔ Нет доступа."); return
