@@ -672,12 +672,62 @@ def is_admin_user(user_id: int) -> bool:
 
 
 def get_exchange_for(ticker: str) -> str:
-    """All webhook entries trade if exchange credentials exist. Preference: BingX → Bybit."""
+    """Single-exchange fallback preference: BingX → Bybit."""
     if BINGX_AVAILABLE:
         return "bingx"
     if BYBIT_AVAILABLE:
         return "bybit"
     return "none"
+
+
+def _execution_mode() -> str:
+    return str(os.getenv("EXECUTION_MODE", "dual")).strip().lower()
+
+
+def _dual_execution_enabled() -> bool:
+    return _execution_mode() in ("dual", "both", "multi") and BINGX_AVAILABLE and BYBIT_AVAILABLE
+
+
+def _entry_execution_targets() -> list[str]:
+    if _dual_execution_enabled():
+        return ["bingx", "bybit"]
+    primary = get_exchange_for("")
+    return [primary] if primary != "none" else []
+
+
+def _active_exchanges_for(ticker: str, direction: str) -> list[str]:
+    ticker = str(ticker or "").upper().replace(".P", "")
+    direction = str(direction or "").upper()
+    out: list[str] = []
+    with _pos_lock:
+        positions = load_positions()
+        for ex in ("bingx", "bybit"):
+            if positions.get(pos_key(ticker, direction, ex)):
+                out.append(ex)
+        legacy = positions.get(pos_key(ticker, direction))
+        if legacy and not out:
+            ex = str(legacy.get("exchange") or "").lower()
+            out.append(ex if ex in ("bingx", "bybit") else "legacy")
+    return out
+
+
+def _is_exchange_offline_error(exc: Exception | str) -> bool:
+    msg = str(exc).lower()
+    return (
+        "109418" in msg
+        or "offline currently" in msg
+        or "symbol is offline" in msg
+        or "contract is offline" in msg
+    )
+
+
+def _entry_exchange_candidates(primary: str) -> list[str]:
+    out: list[str] = []
+    if primary and primary != "none":
+        out.append(primary)
+    if primary == "bingx" and BYBIT_AVAILABLE:
+        out.append("bybit")
+    return out
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1395,8 +1445,10 @@ def infer_entry_price(text: str):
     return parse_price(text, "🎯 Вход:", "⚡ Вход:", "💰 Цена:", "Цена:")
 
 
-def pos_key(ticker: str, direction: str) -> str:
-    return f"{ticker}_{direction}"
+def pos_key(ticker: str, direction: str, exchange: str | None = None) -> str:
+    base = f"{str(ticker or '').upper().replace('.P', '')}_{str(direction or '').upper()}"
+    ex = str(exchange or "").lower().strip()
+    return f"{base}_{ex}" if ex in ("bingx", "bybit") else base
 
 
 def move_sl(pos: dict, new_sl: float) -> str:
@@ -1561,13 +1613,17 @@ def _trade_instance_id(key: str = "", trade_data: dict | None = None,
     ticker = ""
     direction = ""
     timeframe = ""
+    exchange = ""
     for source in (trade_data, pos, payload or {}):
         if source:
             ticker = ticker or str(source.get("ticker") or source.get("symbol") or "").strip()
             direction = direction or str(source.get("direction") or "").strip()
             timeframe = timeframe or str(source.get("timeframe") or "").strip()
+            exchange = exchange or str(source.get("exchange") or source.get("target_exchange") or "").strip().lower()
 
     base = trade_id or key or "_".join(x for x in (ticker, direction, timeframe) if x)
+    if exchange in ("bingx", "bybit") and f"|{exchange}" not in str(base):
+        base = f"{base}|{exchange}"
     if not base:
         base = "trade"
     if not created_at:
@@ -1580,6 +1636,29 @@ def _highest_tp_hit(pos: dict | None) -> int:
         return 0
     hits = [n for n in range(1, 5) if pos.get(f"tp{n}_hit")]
     return max(hits, default=0)
+
+
+def _reverse_shadow_record(record: dict) -> dict:
+    """Analytics only: estimate opposite-direction result after close. No reverse orders."""
+    pnl = record.get("pnl") if isinstance(record.get("pnl"), dict) else {}
+    pnl_pct = pnl.get("pnl_pct", pnl.get("pct"))
+    try:
+        original_pnl = float(pnl_pct)
+        reverse_proxy = round(-original_pnl, 6)
+    except Exception:
+        original_pnl = None
+        reverse_proxy = None
+    direction = str(record.get("direction") or "").upper()
+    reverse_direction = "SELL" if direction == "BUY" else "BUY" if direction == "SELL" else ""
+    return {
+        "enabled": True,
+        "model": "proxy_v1_pnl_inverse",
+        "original_direction": direction,
+        "reverse_direction": reverse_direction,
+        "original_pnl_pct": original_pnl,
+        "reverse_pnl_proxy_pct": reverse_proxy,
+        "bucket": "|".join(str(record.get(k) or "") for k in ("signal_class", "amd_phase", "timeframe", "direction")),
+    }
 
 
 ENTRY_METADATA_FIELDS = (
@@ -1763,6 +1842,7 @@ def save_trade_to_history(payload: dict, trade_data: dict | None, result: str, t
         "trail_active": bool(pos.get("trail_active", False)),
         "be_active": bool(pos.get("be_active", False)),
     }
+    record["reverse_shadow"] = _reverse_shadow_record(record)
     with _state_lock:
         history = load_history()
         history.append(record)
@@ -2082,24 +2162,27 @@ def _alert_dedup_check(trade_id: str, event: str, ticker: str, timeframe: str) -
         write_log(f"DEDUP_ERR | {e}")
         return False
 
-def dedup_entry(ticker: str, direction: str, current_key: str = ""):
-    """Удаляет старые записи о сделке по тому же тикеру/направлению.
-    Защита: не трогает текущую сделку (current_key) и записи новее 60 сек."""
+def dedup_entry(ticker: str, direction: str, current_key: str = "", exchange: str | None = None):
+    """Удаляет старые записи по тому же ticker/direction/exchange. Не трогает вторую биржу."""
     now = int(time.time())
+    ex_norm = str(exchange or "").lower().strip()
     with _state_lock:
         trades = load_trades()
-        keys_to_remove = [
-            k for k, v in trades.items()
-            if v.get("ticker", "") == ticker
-            and v.get("direction", "") == direction
-            and k != current_key
-            and now - int(v.get("created_at", 0)) > 60
-        ]
+        keys_to_remove = []
+        for k, v in trades.items():
+            if not isinstance(v, dict):
+                continue
+            if v.get("ticker", "") != ticker or v.get("direction", "") != direction or k == current_key:
+                continue
+            if ex_norm in ("bingx", "bybit") and str(v.get("exchange") or "").lower() != ex_norm:
+                continue
+            if now - int(v.get("created_at", 0)) > 60:
+                keys_to_remove.append(k)
         for k in keys_to_remove:
             del trades[k]
         if keys_to_remove:
             save_trades(trades)
-            write_log(f"DEDUP | removed {len(keys_to_remove)} old keys for {ticker}_{direction}")
+            write_log(f"DEDUP | removed {len(keys_to_remove)} old keys for {ticker}_{direction}_{ex_norm or 'legacy'}")
 
 
 def cleanup_old_trades() -> int:
@@ -2184,13 +2267,17 @@ def handle_entry(payload: dict):
     text = payload.get("text", "").strip()
     trade_id = str(payload.get("trade_id") or "")
     timeframe = payload.get("timeframe", "")
-    exchange = get_exchange_for(ticker)
+    target_exchange = str(payload.get("target_exchange") or "").lower().strip()
+    exchange = target_exchange if target_exchange in ("bingx", "bybit") else get_exchange_for(ticker)
     key = build_trade_key(payload)
-    pkey = pos_key(ticker, direction)
+    if key and exchange != "none":
+        key = f"{key}|{exchange}"
+    pkey = pos_key(ticker, direction, exchange)
     trade_mode = "trade" if exchange != "none" else "telegram_only"
 
     with _pos_lock:
-        existing_pos = load_positions().get(pkey)
+        _positions_now = load_positions()
+        existing_pos = _positions_now.get(pkey) or _positions_now.get(pos_key(ticker, direction))
     if existing_pos:
         write_log(f"ENTRY_SKIP | {ticker} {direction} | DUPLICATE — active position already exists for {pkey}")
         # BUG 2 FIX: still forward the signal text to Telegram even on duplicate
@@ -2202,12 +2289,17 @@ def handle_entry(payload: dict):
     # ✅ IMPROVEMENT #2: Dedup — блокируем одинаковые алерты за 60 сек
     timeframe_str = str(payload.get("timeframe", "")).strip()
     trade_id_str  = str(payload.get("trade_id") or "")
+    if exchange != "none":
+        trade_id_str = f"{trade_id_str}|{exchange}"
     if _alert_dedup_check(trade_id_str, "entry", ticker, timeframe_str):
         write_log(f"ENTRY_DEDUP | {ticker} {direction} {timeframe_str} — skipped duplicate")
         return
 
-    source_msg = send_signals(text or f"📥 Вход {ticker} {direction}")
-    source_msg_id = source_msg.get("message_id")
+    if payload.get("_skip_signal_send"):
+        source_msg_id = payload.get("_source_msg_id")
+    else:
+        source_msg = send_signals(text or f"📥 Вход {ticker} {direction}")
+        source_msg_id = source_msg.get("message_id")
 
     side = "Buy" if direction == "BUY" else "Sell"
     opp_side = "Sell" if side == "Buy" else "Buy"
@@ -2306,14 +2398,44 @@ def handle_entry(payload: dict):
     emergency_unprotected = False
 
     if trade_mode == "trade":
-        ex_set_leverage(ticker, leverage, exchange)
-
-        try:
-            price = ex_get_price(ticker, exchange)
-        except Exception as e:
-            write_log(f"ENTRY_ERR | get_price | {ticker} ({exchange}) | {e}")
+        prepared = False
+        last_prepare_err: Exception | None = None
+        original_exchange = exchange
+        _candidates = [exchange] if target_exchange in ("bingx", "bybit") else _entry_exchange_candidates(exchange)
+        for candidate_exchange in _candidates:
+            try:
+                ex_set_leverage(ticker, leverage, candidate_exchange)
+                price = ex_get_price(ticker, candidate_exchange)
+                if candidate_exchange != original_exchange:
+                    write_log(f"EXCHANGE_FALLBACK | {ticker} {direction} | {original_exchange}→{candidate_exchange} reason={last_prepare_err}")
+                    log_event(
+                        "exchange_fallback",
+                        ticker=ticker,
+                        direction=direction,
+                        trade_id=trade_id,
+                        from_exchange=original_exchange,
+                        to_exchange=candidate_exchange,
+                        reason=str(last_prepare_err or ""),
+                    )
+                    send_signals(
+                        f"⚠️ <b>{ticker} {direction}</b>\n"
+                        f"BingX недоступен, пробую Bybit fallback.",
+                        reply_to=source_msg_id,
+                    )
+                exchange = candidate_exchange
+                prepared = True
+                break
+            except Exception as e:
+                last_prepare_err = e
+                write_log(f"ENTRY_PREPARE_ERR | {ticker} ({candidate_exchange}) | {e}")
+                if candidate_exchange == "bingx" and _is_exchange_offline_error(e) and BYBIT_AVAILABLE:
+                    continue
+                break
+        if not prepared:
+            write_log(f"ENTRY_ERR | prepare_exchange | {ticker} ({exchange}) | {last_prepare_err}")
             send_signals(
-                f"❌ <b>Ошибка входа {ticker}</b>\nЦена недоступна ({exchange}): {e}",
+                f"❌ <b>Ошибка входа {ticker}</b>\n"
+                f"Биржа/цена недоступна ({exchange}): {last_prepare_err}",
                 reply_to=source_msg_id,
             )
             return
@@ -2461,11 +2583,11 @@ def handle_entry(payload: dict):
         "margin_usdt": round((float(price or 0) * float(qty or 0)) / leverage, 8) if leverage > 0 else None,
         "sl_price": sl_price,
     }
-    dedup_entry(ticker, direction, current_key=key)
+    dedup_entry(ticker, direction, current_key=key, exchange=exchange)
     if key:
         put_trade(key, trade_record)
 
-    pkey = pos_key(ticker, direction)
+    pkey = pos_key(ticker, direction, exchange)
     with _pos_lock:
         positions = load_positions()
         positions[pkey] = {
@@ -2523,7 +2645,10 @@ def handle_tp_hit(payload: dict):
         write_log(f"TP_REJECT | {ticker} TP{tp_num} | valid levels are TP1..TP4")
         return
     text = payload.get("text", "").strip()
+    target_exchange = str(payload.get("target_exchange") or "").lower().strip()
     key = build_trade_key(payload)
+    if key and target_exchange in ("bingx", "bybit"):
+        key = f"{key}|{target_exchange}"
     trade_key, trade = find_trade_entry(
         key=key,
         trade_id=str(payload.get("trade_id") or ""),
@@ -2532,7 +2657,7 @@ def handle_tp_hit(payload: dict):
     )
     reply_id = (trade or {}).get("message_id")
 
-    pkey = pos_key(ticker, direction)
+    pkey = pos_key(ticker, direction, target_exchange)
     final_close = False
     pos_snapshot = None
     highest_tp = tp_num
@@ -2651,7 +2776,10 @@ def handle_sl_hit(payload: dict):
     ticker = payload.get("ticker", "").upper().replace(".P", "")
     direction = (payload.get("direction") or "").upper()
     text = payload.get("text", "").strip()
+    target_exchange = str(payload.get("target_exchange") or "").lower().strip()
     key = build_trade_key(payload)
+    if key and target_exchange in ("bingx", "bybit"):
+        key = f"{key}|{target_exchange}"
     trade_key, trade = find_trade_entry(
         key=key,
         trade_id=str(payload.get("trade_id") or ""),
@@ -2659,7 +2787,7 @@ def handle_sl_hit(payload: dict):
         direction=direction,
     )
 
-    pkey = pos_key(ticker, direction)
+    pkey = pos_key(ticker, direction, target_exchange)
     pos_snapshot = None
     highest_tp = 0
     _found_pos_sl = True  # Bug 2 Fix flag
@@ -2817,7 +2945,10 @@ def handle_sl_moved(payload: dict):
     ticker    = payload.get("ticker", "").upper().replace(".P", "")
     direction = (payload.get("direction") or "").upper()
     text      = payload.get("text", "").strip()
+    target_exchange = str(payload.get("target_exchange") or "").lower().strip()
     key       = build_trade_key(payload)
+    if key and target_exchange in ("bingx", "bybit"):
+        key = f"{key}|{target_exchange}"
 
     trade_key, trade = find_trade_entry(
         key=key,
@@ -2836,7 +2967,7 @@ def handle_sl_moved(payload: dict):
     if not new_sl:
         write_log(f"SL_MOVED_REJECT | {ticker} | missing/invalid new_sl")
         return
-    pkey = pos_key(ticker, direction)
+    pkey = pos_key(ticker, direction, target_exchange)
     payload_trade_id = str(payload.get("trade_id") or "").strip()
     with _pos_lock:
         positions = load_positions()
@@ -2918,7 +3049,7 @@ def close_position_manually(pos: dict, source: str) -> tuple[bool, str]:
 
     with _pos_lock:
         positions = load_positions()
-        positions.pop(pos_key(ticker, direction), None)
+        positions.pop(pos_key(ticker, direction, exchange), None)
         save_positions(positions)
 
     reply_id = (trade or {}).get("message_id") or pos.get("message_id")
@@ -2967,6 +3098,16 @@ def process_signal(payload: dict):
     text = payload.get("text", "").strip()
     key  = build_trade_key(payload)
 
+    if event in ("entry", "limit_hit") and not payload.get("target_exchange") and _dual_execution_enabled():
+        source_msg = send_signals(text or f"📥 Вход {payload.get('ticker','')} {payload.get('direction','')}")
+        source_msg_id = source_msg.get("message_id")
+        for ex in _entry_execution_targets():
+            p2 = dict(payload)
+            p2["target_exchange"] = ex
+            p2["_skip_signal_send"] = True
+            p2["_source_msg_id"] = source_msg_id
+            handle_entry(p2)
+        return
     if event == "entry":
         handle_entry(payload)
     elif event == "limit_hit":
@@ -2977,10 +3118,37 @@ def process_signal(payload: dict):
     elif event == "limit_order":
         send_signals(text or f"📋 Лимитный ордер {payload.get('ticker','')}")
     elif event == "tp_hit":
+        if not payload.get("target_exchange") and _dual_execution_enabled():
+            targets = _active_exchanges_for(payload.get("ticker", ""), payload.get("direction", ""))
+            if targets:
+                for ex in targets:
+                    p2 = dict(payload)
+                    if ex in ("bingx", "bybit"):
+                        p2["target_exchange"] = ex
+                    handle_tp_hit(p2)
+                return
         handle_tp_hit(payload)
     elif event == "sl_hit":
+        if not payload.get("target_exchange") and _dual_execution_enabled():
+            targets = _active_exchanges_for(payload.get("ticker", ""), payload.get("direction", ""))
+            if targets:
+                for ex in targets:
+                    p2 = dict(payload)
+                    if ex in ("bingx", "bybit"):
+                        p2["target_exchange"] = ex
+                    handle_sl_hit(p2)
+                return
         handle_sl_hit(payload)
     elif event == "sl_moved":
+        if not payload.get("target_exchange") and _dual_execution_enabled():
+            targets = _active_exchanges_for(payload.get("ticker", ""), payload.get("direction", ""))
+            if targets:
+                for ex in targets:
+                    p2 = dict(payload)
+                    if ex in ("bingx", "bybit"):
+                        p2["target_exchange"] = ex
+                    handle_sl_moved(p2)
+                return
         handle_sl_moved(payload)
     elif event == "scale_in":
         trade    = get_trade(key) if key else None
@@ -4476,7 +4644,9 @@ def health():
         "positions":     len(load_positions()),
         "emergency":     _emergency_stop.is_set(),
         "pair_gate":     "disabled",
-        "execution_preference": "bingx" if BINGX_AVAILABLE else ("bybit" if BYBIT_AVAILABLE else "none"),
+        "execution_preference": "dual" if _dual_execution_enabled() else ("bingx" if BINGX_AVAILABLE else ("bybit" if BYBIT_AVAILABLE else "none")),
+        "execution_mode": _execution_mode(),
+        "execution_targets": _entry_execution_targets(),
         "bybit_pairs":   "ignored",
         "bingx_pairs":   "ignored",
         "time_msk":      _msk().strftime("%Y-%m-%d %H:%M"),
