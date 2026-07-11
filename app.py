@@ -2290,7 +2290,10 @@ def handle_entry(payload: dict):
     timeframe_str = str(payload.get("timeframe", "")).strip()
     trade_id_str  = str(payload.get("trade_id") or "")
     if exchange != "none":
-        trade_id_str = f"{trade_id_str}|{exchange}"
+        # Exchange must be at the beginning because _alert_dedup_check uses
+        # the first 16 chars for Redis key compactness. If appended, BingX and
+        # Bybit legs share the same dedup key and the second leg is blocked.
+        trade_id_str = f"{exchange}|{trade_id_str}"
     if _alert_dedup_check(trade_id_str, "entry", ticker, timeframe_str):
         write_log(f"ENTRY_DEDUP | {ticker} {direction} {timeframe_str} — skipped duplicate")
         return
