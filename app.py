@@ -1381,17 +1381,134 @@ def move_sl(pos: dict, new_sl: float) -> str:
     # Не трогаем позиции без биржи или с нулевым объёмом
     if exchange == "none" or remaining <= 0:
         return ""
-    cancel_sl_order(pos)  # TP1..TP4 remain active while only SL is replaced.
-    time.sleep(0.3)
+    old_sl_order_id = pos.get("sl_order_id")
     try:
+        # Safe replace: сначала ставим новый SL, потом отменяем старый.
+        # Если новая заявка не поставилась — старый SL остаётся жить.
         resp = ex_place_stop(symbol, opp_side, remaining, new_sl, exchange)
+        new_order_id = ""
         if exchange == "bybit" and resp.get("retCode") == 0:
-            return resp["result"].get("orderId", "")
+            new_order_id = resp["result"].get("orderId", "")
         elif exchange == "bingx":
-            return _bingx_order_id(resp) or "ok"
+            new_order_id = _bingx_order_id(resp) or "ok"
+        if not new_order_id:
+            write_log(f"SL_MOVE_ERR | {symbol} ({exchange}) | new stop not confirmed")
+            return ""
+        if old_sl_order_id and str(old_sl_order_id) not in ("ok", ""):
+            old_pos = dict(pos)
+            old_pos["sl_order_id"] = old_sl_order_id
+            cancel_sl_order(old_pos)  # TP1..TP4 remain active while only SL is replaced.
+        return new_order_id
     except Exception as e:
         write_log(f"SL_MOVE_ERR | {symbol} ({exchange}) | {e}")
     return ""
+
+
+def _truthy(v) -> bool:
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return False
+    return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _float_or_none(v):
+    try:
+        if v is None or str(v).strip().lower() in ("", "none", "null", "nan"):
+            return None
+        x = float(v)
+        return x if math.isfinite(x) and x > 0 else None
+    except Exception:
+        return None
+
+
+def _sl_improves(direction: str, current_sl, new_sl: float) -> bool:
+    cur = _float_or_none(current_sl)
+    if cur is None:
+        return True
+    return new_sl > cur if direction == "BUY" else new_sl < cur
+
+
+def _bot_fallback_sl_after_tp(pos: dict, highest_tp: int) -> tuple[float | None, str, bool, bool]:
+    """Bot-side protection when Pine sl_moved alert is missing.
+
+    TP2 fallback: move SL to TP1 with buffer, never worse than entry.
+    TP3 fallback: move SL toward TP2 with ATR buffer, never worse than entry.
+    """
+    direction = str(pos.get("direction") or "").upper()
+    entry = _float_or_none(pos.get("entry_price"))
+    if direction not in ("BUY", "SELL") or entry is None:
+        return None, "", False, False
+
+    try:
+        buffer_pct = float(os.environ.get("BE_TP2_BUFFER_PCT", "0.0") or 0.0)
+    except Exception:
+        buffer_pct = 0.0
+    try:
+        atr_pct = float(pos.get("atr_pct") or 0.0)
+    except Exception:
+        atr_pct = 0.0
+    atr_abs = entry * atr_pct / 100.0 if atr_pct > 0 else 0.0
+
+    tp1 = _float_or_none(pos.get("tp1_price"))
+    tp2 = _float_or_none(pos.get("tp2_price"))
+
+    target = None
+    reason = ""
+    be_active = False
+    trail_active = False
+
+    if highest_tp >= 3 and _truthy(pos.get("config_trail_tp3")):
+        base = tp2 or tp1 or entry
+        if direction == "BUY":
+            target = max(base - atr_abs, entry)
+        else:
+            target = min(base + atr_abs, entry)
+        reason = "BOT_FALLBACK_TP3_TRAIL_BASE"
+        trail_active = True
+        be_active = True
+    elif highest_tp >= 2 and _truthy(pos.get("config_be_tp2")):
+        base = tp1 or entry
+        if direction == "BUY":
+            target = max(base * (1 - buffer_pct / 100.0), entry)
+        else:
+            target = min(base * (1 + buffer_pct / 100.0), entry)
+        reason = "BOT_FALLBACK_TP2_BE"
+        be_active = True
+
+    if target is None:
+        return None, "", False, False
+    target = round(float(target), 8)
+    if not _sl_improves(direction, pos.get("sl_price"), target):
+        return None, "", False, False
+    return target, reason, be_active, trail_active
+
+
+def _apply_bot_sl_fallback(pos: dict, highest_tp: int) -> tuple[bool, str]:
+    new_sl, reason, be_active, trail_active = _bot_fallback_sl_after_tp(pos, highest_tp)
+    if not new_sl:
+        return False, ""
+    exchange = pos.get("exchange", "bybit")
+    oid = ""
+    if exchange != "none":
+        oid = move_sl(pos, new_sl)
+        if not oid:
+            write_log(f"BOT_SL_FALLBACK_FAIL | {pos.get('symbol')} {pos.get('direction')} | reason={reason} new_sl={new_sl}")
+            log_event("bot_sl_fallback_fail", ticker=pos.get("symbol"), direction=pos.get("direction"), trade_id=pos.get("trade_id"), reason=reason, new_sl=new_sl, exchange=exchange)
+            return False, ""
+    pos["sl_price"] = new_sl
+    pos["sl_order_id"] = oid
+    pos["sl_moved_count"] = int(pos.get("sl_moved_count") or 0) + 1
+    pos["last_sl_move_reason"] = reason
+    pos["last_sl_moved_at"] = int(time.time())
+    if be_active:
+        pos["be_active"] = True
+    if trail_active:
+        pos["trail_active"] = True
+        pos["trail_sl"] = new_sl
+    write_log(f"BOT_SL_FALLBACK_APPLIED | {pos.get('symbol')} {pos.get('direction')} | TP{highest_tp} reason={reason} sl={new_sl} oid={oid or '-'}")
+    log_event("bot_sl_fallback_applied", ticker=pos.get("symbol"), direction=pos.get("direction"), trade_id=pos.get("trade_id"), highest_tp=highest_tp, reason=reason, new_sl=new_sl, be_active=bool(pos.get("be_active", False)), trail_active=bool(pos.get("trail_active", False)), sl_moved_count=int(pos.get("sl_moved_count") or 0), exchange=exchange, order_id=oid)
+    return True, oid
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2454,6 +2571,9 @@ def handle_tp_hit(payload: dict):
                 positions.pop(pkey, None)
                 final_close = True
             else:
+                # Pine может не прислать sl_moved. Bot обязан сам защитить позицию
+                # после TP2/TP3, иначе TP2+ сделки могут закрыться минусом.
+                _apply_bot_sl_fallback(pos, highest_tp)
                 positions[pkey] = pos
             pos_snapshot = dict(pos)
             save_positions(positions)
@@ -2470,6 +2590,11 @@ def handle_tp_hit(payload: dict):
             remaining_qty=pos_snapshot.get("remaining_qty"),
             trail_active=pos_snapshot.get("trail_active", False),
             be_active=pos_snapshot.get("be_active", False),
+            sl_price=pos_snapshot.get("sl_price"),
+            sl_order_id=pos_snapshot.get("sl_order_id"),
+            sl_moved_count=int(pos_snapshot.get("sl_moved_count") or 0),
+            last_sl_move_reason=pos_snapshot.get("last_sl_move_reason", ""),
+            last_sl_moved_at=pos_snapshot.get("last_sl_moved_at"),
         )
     if final_close:
         # Position fully closed at TP4 (or remaining ≤ min_qty).
