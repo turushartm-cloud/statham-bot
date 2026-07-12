@@ -1867,6 +1867,37 @@ def _trade_already_closed(instance_id: str) -> bool:
         return instance_id in load_closed_trades()
 
 
+def _trade_base_already_closed(base_key: str = "", trade_id: str = "") -> bool:
+    """Detect late TP/SL after trade was already finalized and trade row removed.
+
+    `_trade_instance_id()` needs created_at.  If position+trade already gone, it
+    falls back to current time and cannot match closed_trades exactly.  Base-key
+    check prevents stale TP/SL noise and duplicate terminal messages.
+    """
+    bases = []
+    for raw in (base_key, trade_id):
+        raw = str(raw or "").strip()
+        if not raw:
+            continue
+        bases.append(raw)
+        # Closed instance ids are stored as "<base>:<created_at>".
+        if ":" in raw:
+            bases.append(raw.rsplit(":", 1)[0])
+    bases = [b for b in dict.fromkeys(bases) if len(b) >= 8]
+    if not bases:
+        return False
+    with _state_lock:
+        closed = load_closed_trades()
+        if not isinstance(closed, dict):
+            return False
+        for cid in closed.keys():
+            cid_s = str(cid)
+            for b in bases:
+                if cid_s == b or cid_s.startswith(f"{b}:"):
+                    return True
+    return False
+
+
 def _mark_trade_closed(instance_id: str, result: str, close_reason: str) -> bool:
     if not instance_id:
         return True
@@ -2679,9 +2710,10 @@ def handle_tp_hit(payload: dict):
         pos = positions.get(pkey)
         if not pos:
             instance_id = _trade_instance_id(trade_key or key, trade, None, payload)
-            if _trade_already_closed(instance_id):
+            base_key = trade_key or key or str(payload.get("trade_id") or "")
+            if _trade_already_closed(instance_id) or _trade_base_already_closed(base_key, payload.get("trade_id")):
                 write_log(f"TP_DUPLICATE_SKIP | {ticker} TP{tp_num} | already closed")
-                return  # genuine duplicate — skip silently
+                return  # genuine duplicate / stale terminal — skip silently
             # Bug 2 Fix: position missing but NOT a duplicate → mark and return
             _found_pos = False
             # Exit early — position logic below requires valid pos, Telegram msg sent after lock
@@ -2808,7 +2840,8 @@ def handle_sl_hit(payload: dict):
         pos = positions.get(pkey)
         if not pos:
             instance_id = _trade_instance_id(trade_key or key, trade, None, payload)
-            if _trade_already_closed(instance_id):
+            base_key = trade_key or key or str(payload.get("trade_id") or "")
+            if _trade_already_closed(instance_id) or _trade_base_already_closed(base_key, payload.get("trade_id")):
                 write_log(f"SL_DUPLICATE_SKIP | {ticker} | already closed")
                 return
             _found_pos_sl = False
