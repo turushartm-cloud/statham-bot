@@ -2987,6 +2987,19 @@ def handle_sl_moved(payload: dict):
             write_log(f"SL_MOVED_STALE_SKIP | {ticker} {direction} | payload_trade_id={payload_trade_id or '-'} pos_trade_id={pos_trade_id or '-'}")
             log_event("sl_moved_stale_skip", ticker=ticker, direction=direction, trade_id=payload_trade_id, pos_trade_id=pos_trade_id)
             return
+        if not _sl_improves(direction, pos.get("sl_price"), new_sl):
+            write_log(f"SL_MOVED_LOOSEN_SKIP | {ticker} {direction} | current_sl={pos.get('sl_price')} new_sl={new_sl}")
+            log_event(
+                "sl_moved_loosen_skip",
+                ticker=ticker,
+                direction=direction,
+                trade_id=payload_trade_id,
+                current_sl=pos.get("sl_price"),
+                new_sl=new_sl,
+                exchange=pos.get("exchange", "none"),
+                reason="new_sl_does_not_improve_current_sl",
+            )
+            return
         reply_id = (trade or {}).get("message_id") or pos.get("message_id")
         send_signals(text or f"🔒 SL сдвинут {ticker}", reply_to=reply_id)
         oid = ""
