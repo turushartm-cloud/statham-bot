@@ -1316,6 +1316,31 @@ def ex_live_position_qty(ticker: str, direction: str, exchange: str) -> float:
     return 0.0
 
 
+def sync_live_remaining_qty(pos: dict, reason: str = "") -> float:
+    """Use exchange position size as the only source of truth for protective SL qty.
+
+    After partial TP fills, Redis remaining_qty may be stale/too large because of
+    exchange rounding and async event order.  A moved SL must protect 100% of the
+    live remaining position, not the original order size.
+    """
+    if not pos:
+        return 0.0
+    exchange = pos.get("exchange", "bybit")
+    if exchange == "none":
+        return float(pos.get("remaining_qty") or pos.get("total_qty") or 0.0)
+    symbol = pos.get("symbol") or ""
+    direction = pos.get("direction") or ""
+    stored = float(pos.get("remaining_qty") or pos.get("total_qty") or 0.0)
+    live = ex_live_position_qty(symbol, direction, exchange)
+    qty = live if live > 0 else stored
+    if qty > 0:
+        pos["remaining_qty"] = qty
+    if reason:
+        write_log(f"SL_QTY_SYNC | {symbol} {direction} [{exchange}] | reason={reason} stored={stored} live={live} used={qty}")
+        log_event("sl_qty_sync", ticker=symbol, direction=direction, exchange=exchange, reason=reason, stored_qty=stored, live_qty=live, used_qty=qty, trade_id=pos.get("trade_id"))
+    return qty
+
+
 def ex_place_stop(ticker: str, side: str, qty: float,
                   trigger_price: float, exchange: str) -> dict:
     if exchange == "bingx": return bingx_place_stop(ticker, side, qty, trigger_price)
@@ -1464,7 +1489,7 @@ def move_sl(pos: dict, new_sl: float) -> str:
     exchange  = pos.get("exchange", "bybit")
     symbol    = pos["symbol"]
     opp_side  = pos["opp_side"]
-    remaining = pos.get("remaining_qty", pos["total_qty"])
+    remaining = sync_live_remaining_qty(pos, "move_sl")
     # Не трогаем позиции без биржи или с нулевым объёмом
     if exchange == "none" or remaining <= 0:
         return ""
@@ -1472,8 +1497,25 @@ def move_sl(pos: dict, new_sl: float) -> str:
     try:
         # Safe replace: сначала ставим новый SL, потом отменяем старый.
         # Если новая заявка не поставилась — старый SL остаётся жить.
-        resp = ex_place_stop(symbol, opp_side, remaining, new_sl, exchange)
+        try:
+            resp = ex_place_stop(symbol, opp_side, remaining, new_sl, exchange)
+        except Exception as e:
+            # BingX/Bybit can reject a protective order if TP filled milliseconds
+            # earlier and cached remaining_qty is now too large. Refresh once and retry.
+            fresh_remaining = sync_live_remaining_qty(pos, "move_sl_retry")
+            if fresh_remaining > 0 and abs(fresh_remaining - remaining) > 1e-12:
+                write_log(f"SL_MOVE_RETRY | {symbol} ({exchange}) | qty {remaining} → {fresh_remaining} | {e}")
+                resp = ex_place_stop(symbol, opp_side, fresh_remaining, new_sl, exchange)
+                remaining = fresh_remaining
+            else:
+                raise
         new_order_id = ""
+        if exchange == "bybit" and resp.get("retCode") != 0:
+            fresh_remaining = sync_live_remaining_qty(pos, "move_sl_bybit_retry")
+            if fresh_remaining > 0 and abs(fresh_remaining - remaining) > 1e-12:
+                write_log(f"SL_MOVE_RETRY | {symbol} ({exchange}) | qty {remaining} → {fresh_remaining} | ret={resp.get('retCode')} {resp.get('retMsg','')}")
+                resp = ex_place_stop(symbol, opp_side, fresh_remaining, new_sl, exchange)
+                remaining = fresh_remaining
         if exchange == "bybit" and resp.get("retCode") == 0:
             new_order_id = resp["result"].get("orderId", "")
         elif exchange == "bingx":
@@ -2750,7 +2792,16 @@ def handle_tp_hit(payload: dict):
             elif close_qty <= 0:
                 close_qty = 0.0
 
-            new_remaining = max(0.0, remaining - close_qty)
+            calc_remaining = max(0.0, remaining - close_qty)
+            new_remaining = calc_remaining
+            if exchange != "none":
+                live_remaining = ex_live_position_qty(ticker, direction, exchange)
+                # Trust exchange live size after partial TP if it is sane.
+                # This keeps later BE/TRAIL SL orders equal to the full live remainder.
+                if live_remaining > 0 and live_remaining <= remaining + 1e-12:
+                    new_remaining = live_remaining
+                    write_log(f"TP_REMAINING_SYNC | {ticker} TP{tp_num} [{exchange}] | calc={calc_remaining} live={live_remaining} used={new_remaining}")
+                    log_event("tp_remaining_sync", ticker=ticker, direction=direction, exchange=exchange, tp_num=tp_num, calc_remaining=calc_remaining, live_remaining=live_remaining, used_remaining=new_remaining, trade_id=pos.get("trade_id"))
             for n in newly_hit:
                 pos[f"tp{n}_hit"] = True
                 tp_ids = pos.get("tp_order_ids")
