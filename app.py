@@ -100,6 +100,14 @@ RENDER_URL        = os.environ.get("RENDER_URL",        "")
 TESTNET = os.environ.get("TESTNET", "false").lower() == "true"
 
 # Bybit
+# BYBIT_MODE:
+#   testnet — testnet.bybit.com keys, pybit testnet=True
+#   demo    — Bybit demo trading keys, pybit demo=True
+#   live    — live keys, pybit testnet=False/demo=False
+_BYBIT_MODE_ENV = os.environ.get("BYBIT_MODE", "").strip().lower()
+BYBIT_MODE = _BYBIT_MODE_ENV if _BYBIT_MODE_ENV in ("demo", "testnet", "live") else ("testnet" if TESTNET else "live")
+BYBIT_TESTNET = BYBIT_MODE == "testnet"
+BYBIT_DEMO = BYBIT_MODE == "demo"
 BYBIT_API_KEY    = os.environ.get("BYBIT_API_KEY",    "")
 BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET", "")
 
@@ -815,11 +823,12 @@ def bybit():
     with _bybit_lock:
         if _bybit_session is None:
             _bybit_session = BybitHTTP(
-                testnet=TESTNET,
+                testnet=BYBIT_TESTNET,
+                demo=BYBIT_DEMO,
                 api_key=BYBIT_API_KEY,
                 api_secret=BYBIT_API_SECRET,
             )
-            write_log(f"BYBIT | connected | testnet={TESTNET}")
+            write_log(f"BYBIT | connected | mode={BYBIT_MODE} | testnet={BYBIT_TESTNET} | demo={BYBIT_DEMO}")
     return _bybit_session
 
 
@@ -2909,7 +2918,7 @@ def handle_sl_hit(payload: dict):
 
     _exch_label = ""
     if _exchange_sl != "none":
-        _demo_flag = "🧪DEMO" if (_exchange_sl == "bingx" and BINGX_DEMO) else ("🧪TEST" if TESTNET else "🔴LIVE")
+        _demo_flag = "🧪DEMO" if ((_exchange_sl == "bingx" and BINGX_DEMO) or (_exchange_sl == "bybit" and BYBIT_DEMO)) else ("🧪TEST" if (_exchange_sl == "bybit" and BYBIT_TESTNET) else ("🧪TEST" if TESTNET else "🔴LIVE"))
         _exch_label = f" [{_exchange_sl.upper()} {_demo_flag}]"
 
     _tp_part_sign = "+" if pnl["tp_pnl_pct"] >= 0 else ""
@@ -4654,6 +4663,9 @@ def health():
         "tp_contract": TP_CONTRACT,
         "testnet":       TESTNET,
         "bybit":         BYBIT_AVAILABLE,
+        "bybit_mode":    BYBIT_MODE,
+        "bybit_testnet": BYBIT_TESTNET,
+        "bybit_demo":    BYBIT_DEMO,
         "bingx":         BINGX_AVAILABLE,
         "bingx_demo":    BINGX_DEMO,
         "active_trades": len(load_trades()),
