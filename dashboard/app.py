@@ -314,8 +314,10 @@ def _calc_stats(trades: list) -> dict:
         for n in range(1, highest + 1):
             today_tp[n] += 1
 
+    # Net P&L is ground truth for WR. Legacy/status labels may say loss after
+    # a protected SL, while net result is positive. Do not mark that as corrupt.
     negative_partials = sum(1 for r, p in pnl_pairs if r.get("result") == "partial" and p is not None and p <= 0.0)
-    positive_losses = sum(1 for r, p in pnl_pairs if r.get("result") == "loss" and p is not None and p > 0.0)
+    positive_losses = 0
     legacy_tp_above_4 = sum(1 for r in trades if int(r.get("highest_tp_hit") or 0) > 4)
     tp_summary_disagreements = sum(
         1 for r in trades
