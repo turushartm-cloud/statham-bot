@@ -1529,6 +1529,9 @@ def move_sl(pos: dict, new_sl: float) -> str:
             cancel_sl_order(old_pos)  # TP1..TP4 remain active while only SL is replaced.
         return new_order_id
     except Exception as e:
+        if _is_position_not_exist_error(e):
+            pos["_phantom_position"] = True
+            pos["_phantom_reason"] = str(e)
         write_log(f"SL_MOVE_ERR | {symbol} ({exchange}) | {e}")
     return ""
 
@@ -2188,6 +2191,37 @@ def remove_trade(key: str):
             save_trades(t)
 
 
+def _is_position_not_exist_error(exc) -> bool:
+    msg = str(exc).lower()
+    return (
+        "position not exist" in msg
+        or "position not exists" in msg
+        or "position does not exist" in msg
+        or "position not found" in msg
+    )
+
+
+def _remove_position_and_trade_for_phantom(pkey: str, pos: dict, reason: str = "phantom_position") -> bool:
+    """Remove stale active position/trade only after exchange proves position absent."""
+    if not pkey or not pos:
+        return False
+    removed = False
+    with _pos_lock:
+        positions = load_positions()
+        if pkey in positions:
+            positions.pop(pkey, None)
+            save_positions(positions)
+            removed = True
+    trade_removed = _remove_trades_for_phantom_positions([pos], reason) if removed else 0
+    if removed:
+        symbol = pos.get("symbol") or pos.get("ticker") or pkey
+        direction = pos.get("direction") or ""
+        exchange = pos.get("exchange") or ""
+        write_log(f"PHANTOM_POSITION_CLEANUP | {symbol} {direction} [{exchange}] | pkey={pkey} reason={reason} trades_removed={trade_removed}")
+        log_event("phantom_position_cleanup", ticker=symbol, direction=direction, exchange=exchange, pkey=pkey, reason=reason, trades_removed=trade_removed, trade_id=pos.get("trade_id"))
+    return removed
+
+
 def _remove_trades_for_phantom_positions(phantom_positions: list[dict], reason: str = "sync_phantom") -> int:
     """Remove active trade records whose exchange position was proven absent.
 
@@ -2820,7 +2854,12 @@ def handle_tp_hit(payload: dict):
                 # Pine может не прислать sl_moved. Bot обязан сам защитить позицию
                 # после TP2/TP3, иначе TP2+ сделки могут закрыться минусом.
                 _apply_bot_sl_fallback(pos, highest_tp)
-                positions[pkey] = pos
+                if pos.get("_phantom_position"):
+                    positions.pop(pkey, None)
+                    _remove_trades_for_phantom_positions([pos], "tp_fallback_position_not_exist")
+                    write_log(f"TP_FALLBACK_PHANTOM_CLEANUP | {ticker} {direction} [{exchange}] | pkey={pkey}")
+                else:
+                    positions[pkey] = pos
             pos_snapshot = dict(pos)
             save_positions(positions)
 
@@ -3780,6 +3819,9 @@ def _position_manager():
                 needs_trail = highest_tp >= 3 and _truthy(pos.get("config_trail_tp3")) and not _truthy(pos.get("trail_active"))
                 if needs_be or needs_trail:
                     applied, _oid = _apply_bot_sl_fallback(pos, highest_tp)
+                    if pos.get("_phantom_position"):
+                        _remove_position_and_trade_for_phantom(pkey, pos, "position_manager_sl_move_position_not_exist")
+                        continue
                     if applied:
                         with _pos_lock:
                             p2 = load_positions()
