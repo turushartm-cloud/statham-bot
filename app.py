@@ -115,6 +115,12 @@ BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET", "")
 BINGX_API_KEY    = os.environ.get("BINGX_API_KEY",    "")
 BINGX_API_SECRET = os.environ.get("BINGX_API_SECRET", "")
 BINGX_DEMO       = os.environ.get("BINGX_DEMO", "false").lower() == "true"
+# BE-late policy: when a TP fills but price already snapped back past the new
+# protective SL, the old code skipped the SL move and left the wide original SL
+# in place (ROSE case: TP2 hit, closed -4.13%). "close_market" = close remainder
+# at market reduce-only instead of holding the wide stop. Default "skip" keeps
+# legacy behavior; enable "close_market" on demo first.
+BE_LATE_POLICY   = os.environ.get("BE_LATE_POLICY", "skip").strip().lower()
 RENDER_SECRET    = (os.environ.get("RENDER_SECRET", "").strip()
                     or os.environ.get("DASHBOARD_SECRET", "").strip())
 
@@ -1572,15 +1578,24 @@ def _bot_fallback_sl_after_tp(pos: dict, highest_tp: int) -> tuple[float | None,
     if direction not in ("BUY", "SELL") or entry is None:
         return None, "", False, False
 
-    try:
-        buffer_pct = float(os.environ.get("BE_TP2_BUFFER_PCT", "0.0") or 0.0)
-    except Exception:
-        buffer_pct = 0.0
+    # Prefer Pine payload config; ENV only fallback for old alerts.
+    def _pos_or_env_float(pos_field: str, env_name: str, default: float) -> float:
+        v = _float_or_none(pos.get(pos_field))
+        if v is not None:
+            return v
+        try:
+            return float(os.environ.get(env_name, "") or default)
+        except Exception:
+            return default
+
+    buffer_pct_tp2 = _pos_or_env_float("config_be_tp2_buffer_pct", "BE_TP2_BUFFER_PCT", 0.3)
+    buffer_pct_tp3 = _pos_or_env_float("config_be_tp3_buffer_pct", "BE_TP3_BUFFER_PCT", 0.3)
+    trail_atr_mult = _pos_or_env_float("config_trail_atr_mult", "TRAIL_ATR_MULT", 1.0)
     try:
         atr_pct = float(pos.get("atr_pct") or 0.0)
     except Exception:
         atr_pct = 0.0
-    atr_abs = entry * atr_pct / 100.0 if atr_pct > 0 else 0.0
+    atr_abs = entry * atr_pct / 100.0 * trail_atr_mult if atr_pct > 0 else 0.0
 
     tp1 = _float_or_none(pos.get("tp1_price"))
     tp2 = _float_or_none(pos.get("tp2_price"))
@@ -1591,20 +1606,24 @@ def _bot_fallback_sl_after_tp(pos: dict, highest_tp: int) -> tuple[float | None,
     trail_active = False
 
     if highest_tp >= 3 and _truthy(pos.get("config_trail_tp3")):
-        base = tp2 or tp1 or entry
-        if direction == "BUY":
-            target = max(base - atr_abs, entry)
+        if tp1:
+            base = tp1 * (1 - buffer_pct_tp3 / 100.0) if direction == "BUY" else tp1 * (1 + buffer_pct_tp3 / 100.0)
         else:
-            target = min(base + atr_abs, entry)
+            base = entry
+        base2 = tp2 or tp1 or entry
+        if direction == "BUY":
+            target = max(base, base2 - atr_abs, entry)
+        else:
+            target = min(base, base2 + atr_abs, entry)
         reason = "BOT_FALLBACK_TP3_TRAIL_BASE"
         trail_active = True
         be_active = True
     elif highest_tp >= 2 and _truthy(pos.get("config_be_tp2")):
         base = tp1 or entry
         if direction == "BUY":
-            target = max(base * (1 - buffer_pct / 100.0), entry)
+            target = max(base * (1 - buffer_pct_tp2 / 100.0), entry)
         else:
-            target = min(base * (1 + buffer_pct / 100.0), entry)
+            target = min(base * (1 + buffer_pct_tp2 / 100.0), entry)
         reason = "BOT_FALLBACK_TP2_BE"
         be_active = True
 
@@ -1621,6 +1640,31 @@ def _apply_bot_sl_fallback(pos: dict, highest_tp: int) -> tuple[bool, str]:
     if not new_sl:
         return False, ""
     exchange = pos.get("exchange", "bybit")
+    if exchange != "none":
+        try:
+            live_price = ex_get_price(pos.get("symbol"), exchange)
+            direction = str(pos.get("direction") or "").upper()
+            # Protective SL must stay on the valid side of live price.
+            # LONG: stop below market. SHORT: stop above market.
+            if (direction == "BUY" and new_sl >= live_price) or (direction == "SELL" and new_sl <= live_price):
+                # BE-SL landed on the wrong side of the market: price already ran
+                # back past the level we wanted to protect at. Skipping leaves the
+                # wide original SL exposed (the ROSE -4.13% case). close_market
+                # closes the remainder at market reduce-only — never worse than the
+                # already-locked profit level.
+                if BE_LATE_POLICY == "close_market":
+                    write_log(f"BOT_SL_FALLBACK_BE_LATE_CLOSE | {pos.get('symbol')} {direction} [{exchange}] | reason={reason} new_sl={new_sl} live={live_price}")
+                    log_event("bot_sl_fallback_be_late_close", ticker=pos.get("symbol"), direction=direction, trade_id=pos.get("trade_id"), reason=reason, new_sl=new_sl, live_price=live_price, exchange=exchange)
+                    try:
+                        close_position_manually(pos, f"be_late_close_market:{reason}")
+                    except Exception as e:
+                        write_log(f"BOT_SL_FALLBACK_BE_LATE_CLOSE_ERR | {pos.get('symbol')} [{exchange}] | {e}")
+                    return False, ""
+                write_log(f"BOT_SL_FALLBACK_INVALID_SIDE_SKIP | {pos.get('symbol')} {direction} [{exchange}] | reason={reason} new_sl={new_sl} live={live_price}")
+                log_event("bot_sl_fallback_invalid_side_skip", ticker=pos.get("symbol"), direction=direction, trade_id=pos.get("trade_id"), reason=reason, new_sl=new_sl, live_price=live_price, exchange=exchange)
+                return False, ""
+        except Exception as e:
+            write_log(f"BOT_SL_FALLBACK_PRICE_WARN | {pos.get('symbol')} [{exchange}] | {e}")
     oid = ""
     if exchange != "none":
         oid = move_sl(pos, new_sl)
@@ -1721,6 +1765,7 @@ ENTRY_METADATA_FIELDS = (
     "bayes_probability", "mfe_pct", "mae_pct", "config_mtf_threshold",
     "config_bayes_threshold", "config_be_tp1", "config_be_tp2",
     "config_trail_tp3", "config_cascade_sl", "config_counter_trend",
+    "config_be_tp2_buffer_pct", "config_be_tp3_buffer_pct", "config_trail_atr_mult",
     "config_strong_sensitivity",
 )
 
@@ -3943,7 +3988,7 @@ if bot:
             "/retro_fix — коррекция старых win→partial ← BUG#1 FIX\n"
             "/cleanup — удалить зависшие сделки\n"
             "/clean — очистить trades+positions\n"
-            "/logs — последние строки лога\n/diagnostics — проверка всех API\n/redis_fix — переподключить Redis\n/redis_info — статус Redis + ключи\n/redis_clear_history — очистить историю\n/redis_clear_all — очистить всё Redis\n/sync — сверить позиции с биржами\n/pnl — Live P&L открытых позиций"
+            "/logs — последние строки лога\n/diagnostics — проверка всех API\n/redis_fix — переподключить Redis\n/redis_info — статус Redis + ключи\n/redis_clear_history — очистить историю\n/redis_clear_all — очистить всё Redis\n/sync — сверить позиции с биржами\n/pnl — Live P&L открытых позиций\n/buckets [min_n] — P&L по бакетам + reverse-shadow"
         ))
 
     @bot.message_handler(commands=["stats"])
@@ -4088,6 +4133,106 @@ if bot:
             return
         title = f"📅 <b>Месячный отчёт — {month_name_ru.get(msk.month, mo)} {msk.year}</b>"
         _reply(m, _build_report(ts, title, show_last=0, show_top_tickers=True))
+
+
+    @bot.message_handler(commands=["buckets"])
+    def cmd_buckets(m):
+        """P&L buckets + reverse-shadow proxy, analytics only.
+
+        Usage:
+          /buckets              -> min_n=2, last 24h, clean versioned buckets only
+          /buckets 5            -> min_n=5, last 24h
+          /buckets 5 72         -> min_n=5, last 72h
+          /buckets 5 all        -> min_n=5, all history
+        """
+        if not is_admin_user(m.from_user.id):
+            _reply(m, "⛔ Нет доступа."); return
+        args = (m.text or "").split()
+        min_n = 2
+        hours = 24.0
+        if len(args) > 1:
+            try:
+                min_n = max(1, int(args[1]))
+            except Exception:
+                min_n = 2
+        if len(args) > 2:
+            raw_period = str(args[2]).strip().lower()
+            if raw_period in ("all", "все", "всё"):
+                hours = None
+            else:
+                try:
+                    hours = max(1.0, float(raw_period))
+                except Exception:
+                    hours = 24.0
+
+        history = load_history()
+        cutoff = None if hours is None else time.time() - hours * 3600.0
+        buckets: dict = {}
+        scanned = 0
+        skipped_legacy = 0
+        skipped_period = 0
+        for r in history:
+            try:
+                closed_ts = float(r.get("close_time") or r.get("closed_at") or r.get("updated_at") or 0)
+            except Exception:
+                closed_ts = 0.0
+            if cutoff is not None and closed_ts and closed_ts < cutoff:
+                skipped_period += 1
+                continue
+            try:
+                pnl_pct = float((r.get("pnl") or {}).get("pnl_pct"))
+            except Exception:
+                continue
+
+            rs = r.get("reverse_shadow") or {}
+            key = rs.get("bucket") or "|".join(
+                str(r.get(k) or "") for k in ("signal_class", "amd_phase", "timeframe", "direction")
+            )
+            parts = str(key).split("|")
+            if len(parts) < 4 or not all(str(x).strip() for x in parts[:4]):
+                skipped_legacy += 1
+                continue
+
+            scanned += 1
+            b = buckets.setdefault(key, {"n": 0, "pnl_sum": 0.0, "wins": 0, "rev_sum": 0.0, "rev_n": 0})
+            b["n"] += 1
+            b["pnl_sum"] += pnl_pct
+            if pnl_pct > 0:
+                b["wins"] += 1
+            try:
+                b["rev_sum"] += float(rs.get("reverse_pnl_proxy_pct"))
+                b["rev_n"] += 1
+            except Exception:
+                pass
+
+        rows = [(k, v) for k, v in buckets.items() if v["n"] >= min_n]
+        period_txt = "all" if hours is None else f"{int(hours) if float(hours).is_integer() else hours}h"
+        if not rows:
+            _reply(
+                m,
+                f"📊 Нет чистых бакетов с n≥{min_n} за {period_txt}. "
+                f"scanned={scanned}, legacy/empty skipped={skipped_legacy}."
+            )
+            return
+        rows.sort(key=lambda kv: kv[1]["pnl_sum"])
+        lines = [f"📊 <b>Чистые бакеты signal|zone|TF|dir, n≥{min_n}, период={period_txt}</b>"]
+        for key, v in rows[:20]:
+            wr = round(100.0 * v["wins"] / v["n"], 0) if v["n"] else 0
+            rev = round(v["rev_sum"], 1) if v["rev_n"] else None
+            inv = v["n"] >= min_n and v["pnl_sum"] < 0 and rev is not None and rev > 0
+            rev_txt = f", reverse Σ{'+' if rev is not None and rev >= 0 else ''}{rev}%" if rev is not None else ""
+            inv_txt = " ⚠️INV" if inv else ""
+            sign = "+" if v["pnl_sum"] >= 0 else ""
+            lines.append(
+                f"• <code>{key}</code>{inv_txt}\n"
+                f"  n={v['n']} WR={int(wr)}% ΣP&L={sign}{round(v['pnl_sum'], 1)}%{rev_txt}"
+            )
+        lines.append(
+            "\n<i>reverse Σ — proxy-инверсия, реальные reverse-сделки не открываются. "
+            f"scanned={scanned}, legacy/empty skipped={skipped_legacy}, period skipped={skipped_period}.</i>"
+        )
+        lines.append("<i>Команда: /buckets [min_n] [hours|all], напр. /buckets 5 72</i>")
+        _reply(m, "\n".join(lines))
 
     @bot.message_handler(commands=["stats_by_ticker"])
     def cmd_stats_by_ticker(m):
@@ -4913,6 +5058,74 @@ def history_route():
         return jsonify({"error": "forbidden"}), 403
     h = load_history()
     return jsonify({"records": len(h), "last_50": h[-50:]})
+
+
+@app.route("/stats/buckets")
+def stats_buckets_route():
+    """Aggregate closed history by signal_class|amd_phase|timeframe|direction."""
+    if not _http_auth(request):
+        return jsonify({"error": "forbidden"}), 403
+    try:
+        min_n = int(request.args.get("min_n", 1))
+    except (TypeError, ValueError):
+        min_n = 1
+    try:
+        hours = float(request.args.get("hours")) if request.args.get("hours") else None
+    except (TypeError, ValueError):
+        hours = None
+    cutoff = time.time() - hours * 3600 if hours else None
+
+    history = load_history()
+    buckets: dict[str, dict] = {}
+    for rec in history:
+        if cutoff is not None and float(rec.get("close_time") or 0) < cutoff:
+            continue
+        rs = rec.get("reverse_shadow") or {}
+        bucket_key = rs.get("bucket") or "|".join(
+            str(rec.get(k) or "") for k in ("signal_class", "amd_phase", "timeframe", "direction")
+        )
+        try:
+            pnl_pct = float((rec.get("pnl") or {}).get("pnl_pct"))
+        except (TypeError, ValueError):
+            pnl_pct = None
+        try:
+            reverse_pct = float(rs.get("reverse_pnl_proxy_pct"))
+        except (TypeError, ValueError):
+            reverse_pct = None
+        b = buckets.setdefault(bucket_key, {
+            "bucket": bucket_key, "n": 0, "wins": 0,
+            "pnl_sum_pct": 0.0, "pnl_n": 0,
+            "reverse_sum_pct": 0.0, "reverse_n": 0,
+            "tp_hits_sum": 0,
+        })
+        b["n"] += 1
+        b["tp_hits_sum"] += int(rec.get("highest_tp_hit") or 0)
+        if pnl_pct is not None:
+            b["pnl_sum_pct"] += pnl_pct
+            b["pnl_n"] += 1
+            if pnl_pct > 0:
+                b["wins"] += 1
+        if reverse_pct is not None:
+            b["reverse_sum_pct"] += reverse_pct
+            b["reverse_n"] += 1
+
+    out = []
+    for b in buckets.values():
+        if b["n"] < min_n:
+            continue
+        out.append({
+            "bucket": b["bucket"],
+            "n": b["n"],
+            "pnl_total_pct": round(b["pnl_sum_pct"], 4),
+            "winrate_pct": round(100.0 * b["wins"] / b["pnl_n"], 2) if b["pnl_n"] else None,
+            "avg_tp_hit": round(b["tp_hits_sum"] / b["n"], 2) if b["n"] else None,
+            "reverse_shadow_total_pct": round(b["reverse_sum_pct"], 4) if b["reverse_n"] else None,
+            "inversion_candidate": bool(
+                b["pnl_n"] and b["pnl_sum_pct"] < 0 and b["reverse_n"] and b["reverse_sum_pct"] > 0
+            ),
+        })
+    out.sort(key=lambda x: x["pnl_total_pct"] if x["pnl_total_pct"] is not None else 0.0)
+    return jsonify({"buckets": out, "total_records": len(history), "min_n": min_n, "hours": hours})
 
 
 @app.route("/positions")

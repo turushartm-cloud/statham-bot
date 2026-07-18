@@ -254,45 +254,6 @@ def _position_items(positions) -> list[tuple[str, dict]]:
         return [(str(i), v) for i, v in enumerate(positions) if isinstance(v, dict)]
     return []
 
-
-def _calc_reverse_shadow(trades: list) -> dict:
-    buckets: dict[str, dict] = {}
-    for r in trades:
-        rs = r.get("reverse_shadow") or {}
-        key = rs.get("bucket") or "|".join(
-            str(r.get(k) or "") for k in ("signal_class", "amd_phase", "timeframe", "direction")
-        )
-        if not key.strip("|"):
-            continue
-        try:
-            pnl_pct = float((r.get("pnl") or {}).get("pnl_pct"))
-        except (TypeError, ValueError):
-            pnl_pct = None
-        try:
-            rev_pct = float(rs.get("reverse_pnl_proxy_pct"))
-        except (TypeError, ValueError):
-            rev_pct = None
-        b = buckets.setdefault(key, {"n": 0, "pnl": 0.0, "pnl_n": 0, "rev": 0.0, "rev_n": 0})
-        b["n"] += 1
-        if pnl_pct is not None:
-            b["pnl"] += pnl_pct
-            b["pnl_n"] += 1
-        if rev_pct is not None:
-            b["rev"] += rev_pct
-            b["rev_n"] += 1
-    worst = []
-    for key, b in buckets.items():
-        worst.append({
-            "bucket": key,
-            "n": b["n"],
-            "pnl_total_pct": round(b["pnl"], 2),
-            "reverse_shadow_total_pct": round(b["rev"], 2) if b["rev_n"] else None,
-            "inversion_candidate": bool(b["pnl_n"] and b["pnl"] < 0 and b["rev_n"] and b["rev"] > 0),
-        })
-    worst.sort(key=lambda x: x["pnl_total_pct"])
-    candidates = [x for x in worst if x["inversion_candidate"]]
-    return {"total_buckets": len(worst), "inversion_candidates": candidates[:10], "worst": worst[:10]}
-
 def _calc_stats(trades: list) -> dict:
     wins     = [r for r in trades if r.get("result") == "win"]
     losses   = [r for r in trades if r.get("result") == "loss"]
@@ -383,8 +344,6 @@ def _calc_stats(trades: list) -> dict:
         for field, counts in dimension_counts.items():
             value = str(r.get(field) or (r.get("entry_mode") if field == "signal_class" else "unknown"))
             counts[value] = counts.get(value, 0) + 1
-    reverse_shadow = _calc_reverse_shadow(trades)
-
     quality = {
         "pnl_known": pnl_scored,
         "pnl_missing": len(trades) - pnl_scored,
@@ -427,7 +386,6 @@ def _calc_stats(trades: list) -> dict:
         "today_be": today_be,
         "today_total": len(today_trades),
         "quality": quality,
-        "reverse_shadow": reverse_shadow,
     }
 
 def _build_breakdown(history: list, positions=None) -> list:
@@ -1216,11 +1174,6 @@ function renderKPIs(data) {
     if (cnt > 0) todayTpStr += ` TP${i}:${cnt}`;
   }
   if (todayTpStr) badges += `<span class="tp-badge tp1" style="opacity:0.7; font-size:11px;">Today${todayTpStr}</span>`;
-  const rs = s.reverse_shadow || {};
-  const inv = rs.inversion_candidates || [];
-  if (inv.length > 0) {
-    badges += `<span class="tp-badge be">🔁 Reverse shadow: ${inv.length} кандидатов, худший ${inv[0].bucket} ${fmtPnl(inv[0].pnl_total_pct)}</span>`;
-  }
   const q = s.quality || {};
   if ((q.pnl_missing || 0) + (q.negative_partials || 0) + (q.positive_losses || 0) + (q.legacy_tp_above_4 || 0) + (q.tp_summary_disagreements || 0) + (q.duplicate_terminal_events || 0) > 0) {
     badges += `<span class="tp-badge be">⚠ Data: missing P&L ${q.pnl_missing||0}, partial≤0 ${q.negative_partials||0}, loss&gt;0 ${q.positive_losses||0}, TP mismatch ${q.tp_summary_disagreements||0}, legacy TP5+ ${q.legacy_tp_above_4||0}, duplicate terminal ${q.duplicate_terminal_events||0}</span>`;
