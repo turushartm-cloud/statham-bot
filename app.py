@@ -115,6 +115,13 @@ BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET", "")
 BINGX_API_KEY    = os.environ.get("BINGX_API_KEY",    "")
 BINGX_API_SECRET = os.environ.get("BINGX_API_SECRET", "")
 BINGX_DEMO       = os.environ.get("BINGX_DEMO", "false").lower() == "true"
+# BingX codes that mean "target already gone" — cancel of a filled/cancelled
+# order (109400 order not exist) or close of an already-closed position
+# (109420 position not exist). These are idempotent successes, not errors:
+# don't raise, don't log as exchange_error (was 84% of all exchange errors).
+BINGX_IDEMPOTENT_CODES = {
+    c.strip() for c in os.environ.get("BINGX_IDEMPOTENT_CODES", "109400,109420").split(",") if c.strip()
+}
 # BE-late policy: when a TP fills but price already snapped back past the new
 # protective SL, the old code skipped the SL move and left the wide original SL
 # in place (ROSE case: TP2 hit, closed -4.13%). "close_market" = close remainder
@@ -467,6 +474,7 @@ _BS_EVENT_MAP = (
     ("TP_REJECT |", "tp_reject"),
     ("SL_MOVED |", "sl_moved"),
     ("SL_HIT", "sl_hit"),
+    ("BINGX_IDEMPOTENT |", "exchange_idempotent"),
     ("BINGX_API_ERR |", "exchange_error"),
     ("BYBIT_", "exchange_event"),
     ("SYNC_STATE |", "state_sync"),
@@ -1014,6 +1022,11 @@ def _bingx_req(method: str, path: str, params: dict | None = None) -> dict:
     data = resp.json()
     code = data.get("code", 0)
     if code != 0:
+        if str(code) in BINGX_IDEMPOTENT_CODES:
+            # Target already gone → treat as success (idempotent), not an error.
+            write_log(f"BINGX_IDEMPOTENT | {method} {path} | code={code} msg={data.get('msg','')} already_gone")
+            data["_idempotent"] = True
+            return data
         write_log(f"BINGX_API_ERR | {method} {path} | code={code} msg={data.get('msg','')} http={resp.status_code}")
         raise Exception(f"BingX error {code}: {data.get('msg', '')}")
     return data
@@ -1768,6 +1781,20 @@ ENTRY_METADATA_FIELDS = (
     "config_be_tp2_buffer_pct", "config_be_tp3_buffer_pct", "config_trail_atr_mult",
     "config_strong_sensitivity",
 )
+
+
+def _derive_is_strong(payload: dict | None) -> bool:
+    """Pine sends no `is_strong` flag — it encodes strength in signal_class /
+    entry_mode ("STRONG_SMC_ICT"). Reading payload.get("is_strong") alone left
+    it False for every trade. Derive from the class when no explicit flag."""
+    payload = payload or {}
+    explicit = payload.get("is_strong")
+    if isinstance(explicit, bool) and explicit:
+        return True
+    if isinstance(explicit, str) and explicit.strip().lower() in ("1", "true", "yes"):
+        return True
+    cls = (str(payload.get("signal_class") or "") + " " + str(payload.get("entry_mode") or "")).upper()
+    return "STRONG" in cls
 
 
 def _entry_metadata(payload: dict | None) -> dict:
@@ -2730,7 +2757,7 @@ def handle_entry(payload: dict):
         "trade_id": trade_id,
         "trade_key": key,
         "instance_id": instance_id,
-        "is_strong": payload.get("is_strong", False),
+        "is_strong": _derive_is_strong(payload),
         "entry_mode": str(payload.get("entry_mode") or ""),
         "score": payload.get("score"),
         "confirmations": payload.get("confirmations"),
@@ -2784,7 +2811,7 @@ def handle_entry(payload: dict):
             "trade_key": key,
             "instance_id": instance_id,
             "timeframe": timeframe,
-            "is_strong": payload.get("is_strong", False),
+            "is_strong": _derive_is_strong(payload),
             "entry_mode": str(payload.get("entry_mode") or ""),
             "score": payload.get("score"),
             "confirmations": payload.get("confirmations"),

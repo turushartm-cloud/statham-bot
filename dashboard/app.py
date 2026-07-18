@@ -217,6 +217,38 @@ def _safe_pnl(record: dict) -> float | None:
     except (TypeError, ValueError, AttributeError):
         return None
 
+def _safe_pnl_nolev(record: dict) -> float | None:
+    """Return the leverage-free trade return (raw price move %), the honest
+    per-trade number. Dashboard headline uses leveraged pnl_pct (×leverage),
+    which inflates both wins and losses by the same factor."""
+    try:
+        value = (record.get("pnl") or {}).get("pnl_pct_no_lev")
+        value = float(value)
+        return value if math.isfinite(value) else None
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def _dedup_unique(trades: list) -> list:
+    """Collapse dual-exchange executions into one row per signal.
+
+    Same signal fires on BingX+Bybit → two records with one trade_id. Summing
+    both double-counts the trade count and P&L. Returns [(representative_record,
+    mean_nolev_pnl)] — one entry per unique trade_id/instance_id.
+    """
+    from collections import defaultdict
+    groups: dict = defaultdict(list)
+    for r in trades:
+        key = str(r.get("trade_id") or r.get("instance_id") or id(r))
+        groups[key].append(r)
+    out = []
+    for rows in groups.values():
+        vals = [p for p in (_safe_pnl_nolev(r) for r in rows) if p is not None]
+        mean = sum(vals) / len(vals) if vals else None
+        out.append((rows[0], mean))
+    return out
+
+
 def _record_highest_tp(record: dict) -> int:
     """Combine execution and summary evidence without trusting legacy tp_num."""
     candidates = []
@@ -326,16 +358,23 @@ def _calc_stats(trades: list) -> dict:
             for n in range(1, highest + 1):
                 tp_counts[n] += 1
 
-    # P&L by day for chart
-    daily_pnl: dict = {}
+    # P&L by day for chart — leverage-free, deduped per unique signal (was
+    # summing leveraged both-exchange rows -> ~10x inflated).
+    _daily_seen: dict = {}   # day -> {trade_id: [nolev, ...]}
     for r in trades:
         ct = r.get("close_time", 0)
         if not ct:
             continue
+        p = _safe_pnl_nolev(r)
+        if p is None:
+            continue
         day = datetime.fromtimestamp(ct, tz=timezone.utc).astimezone(MSK_TZ).strftime("%Y-%m-%d")
-        pnl = _safe_pnl(r)
-        if pnl is not None:
-            daily_pnl[day] = round(daily_pnl.get(day, 0) + pnl, 2)
+        key = str(r.get("trade_id") or r.get("instance_id") or id(r))
+        _daily_seen.setdefault(day, {}).setdefault(key, []).append(p)
+    daily_pnl: dict = {
+        day: round(sum(sum(v) / len(v) for v in ids.values()), 2)
+        for day, ids in _daily_seen.items()
+    }
 
     # Today stats
     today_cutoff = _today_msk_start()
@@ -385,6 +424,32 @@ def _calc_stats(trades: list) -> dict:
             counts[value] = counts.get(value, 0) + 1
     reverse_shadow = _calc_reverse_shadow(trades)
 
+    # ── Gate 1: honest views — dedup dual-exchange, no-leverage, equity ──────
+    # Three separate distortions in the legacy headline `total_pnl`:
+    #   1) leveraged (pnl_pct = ×leverage)  -> use no_lev
+    #   2) both exchanges counted           -> dedup by trade_id
+    #   3) summed, not compounded           -> equity_return compounds
+    exec_count = len(trades)
+    unique_pairs = _dedup_unique(trades)
+    unique_signals = len(unique_pairs)
+    uniq_vals = [p for _, p in unique_pairs if p is not None]
+    nolev_all = [p for p in (_safe_pnl_nolev(r) for r in trades) if p is not None]
+    pnl_sum_nolev = round(sum(nolev_all), 2) if nolev_all else 0.0
+    pnl_sum_unique_nolev = round(sum(uniq_vals), 2) if uniq_vals else 0.0
+    pnl_avg_unique_nolev = round(sum(uniq_vals) / len(uniq_vals), 3) if uniq_vals else 0.0
+    uniq_wins = sum(1 for v in uniq_vals if v > 0.0)
+    wr_unique = round(uniq_wins / len(uniq_vals) * 100, 1) if uniq_vals else 0.0
+    uniq_w = sum(v for v in uniq_vals if v > 0.0)
+    uniq_l = abs(sum(v for v in uniq_vals if v < 0.0))
+    pf_unique = round(uniq_w / uniq_l, 2) if uniq_l else None
+    # Equity return: compound unique no-lev returns in close-time order. This is
+    # "sequential, full-position, no-leverage" — a real curve, not a % sum.
+    eq = 1.0
+    for _rec, _p in sorted(unique_pairs, key=lambda x: x[0].get("close_time") or 0):
+        if _p is not None:
+            eq *= (1.0 + _p / 100.0)
+    equity_return_pct = round((eq - 1.0) * 100, 2)
+
     quality = {
         "pnl_known": pnl_scored,
         "pnl_missing": len(trades) - pnl_scored,
@@ -413,6 +478,15 @@ def _calc_stats(trades: list) -> dict:
         "pnl_sum_pct": total_pnl,
         "total_pnl": total_pnl,
         "avg_pnl": avg_pnl,
+        # Gate 1 honest views (leveraged headline kept above for continuity)
+        "exec_count": exec_count,
+        "unique_signals": unique_signals,
+        "pnl_sum_nolev": pnl_sum_nolev,
+        "pnl_sum_unique_nolev": pnl_sum_unique_nolev,
+        "pnl_avg_unique_nolev": pnl_avg_unique_nolev,
+        "wr_unique": wr_unique,
+        "pf_unique": pf_unique,
+        "equity_return_pct": equity_return_pct,
         "tp_counts": tp_counts,
         "highest_tp_counts": highest_tp_counts,
         "sl_count": sl_count,
@@ -1026,7 +1100,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
         <!-- P&L Chart -->
         <div class="chart-card">
-          <div class="chart-title">📉 Σ доходностей сделок по дням (не portfolio equity)</div>
+          <div class="chart-title">📉 Σ доходностей по дням · no-lev, уник. сигналы (не portfolio equity)</div>
           <div class="chart-wrap"><canvas id="pnlChart"></canvas></div>
         </div>
 
@@ -1169,9 +1243,24 @@ function renderKPIs(data) {
 
   document.getElementById('kpi-grid').innerHTML = `
     <div class="kpi-card">
-      <div class="kpi-label">Σ Trade P&L %</div>
+      <div class="kpi-label">Σ Trade P&L % (×плечо, задвоено)</div>
       <div class="kpi-value ${pnlClass}">${fmtPnl(s.total_pnl)}</div>
-      <div class="kpi-sub">Avg: ${fmtPnl(s.avg_pnl)} · n=${s.pnl_scored}/${s.total}</div>
+      <div class="kpi-sub">Σ raw · плечо · обе биржи — НЕ реальный доход</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Σ P&L % no-lev (уник.)</div>
+      <div class="kpi-value ${s.pnl_sum_unique_nolev > 0 ? 'green' : s.pnl_sum_unique_nolev < 0 ? 'red' : 'yellow'}">${fmtPnl(s.pnl_sum_unique_nolev)}</div>
+      <div class="kpi-sub">Avg: ${fmtPnl(s.pnl_avg_unique_nolev)} · WR ${s.wr_unique}% · PF ${s.pf_unique ?? '—'}</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Equity return % (compound)</div>
+      <div class="kpi-value ${s.equity_return_pct > 0 ? 'green' : s.equity_return_pct < 0 ? 'red' : 'yellow'}">${fmtPnl(s.equity_return_pct)}</div>
+      <div class="kpi-sub">Уник. сигналы, no-lev, последовательно</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Unique signals</div>
+      <div class="kpi-value accent">${s.unique_signals}</div>
+      <div class="kpi-sub">Исполнений: ${s.exec_count} (BingX+Bybit)</div>
     </div>
     <div class="kpi-card">
       <div class="kpi-label">Win Rate</div>
@@ -1234,13 +1323,17 @@ function renderBreakdown(rows) {
   for (const r of rows) {
     const l = labels[r.label] || { cls: 'both', icon: '•' };
     const pnlClass = r.total_pnl > 0 ? 'green' : r.total_pnl < 0 ? 'red' : 'yellow';
+    const nolevClass = r.pnl_sum_unique_nolev > 0 ? 'green' : r.pnl_sum_unique_nolev < 0 ? 'red' : 'yellow';
     const todayClass = r.today_pnl > 0 ? 'green' : r.today_pnl < 0 ? 'red' : 'yellow';
     html += `
       <div class="breakdown-card">
         <div class="breakdown-title ${l.cls}">${l.icon} ${r.label}</div>
-        <div class="brow"><span class="brow-label">Σ Trade P&L %</span><span class="brow-val ${pnlClass}">${fmtPnl(r.total_pnl)}</span></div>
+        <div class="brow"><span class="brow-label">Σ P&L % no-lev (уник.)</span><span class="brow-val ${nolevClass}">${fmtPnl(r.pnl_sum_unique_nolev)}</span></div>
+        <div class="brow"><span class="brow-label">Equity % (compound)</span><span class="brow-val ${r.equity_return_pct > 0 ? 'green' : r.equity_return_pct < 0 ? 'red' : 'yellow'}">${fmtPnl(r.equity_return_pct)}</span></div>
+        <div class="brow"><span class="brow-label">Уник. / исполнений</span><span class="brow-val">${r.unique_signals} / ${r.exec_count}</span></div>
+        <div class="brow"><span class="brow-label">Σ Trade P&L % (×плечо)</span><span class="brow-val ${pnlClass}">${fmtPnl(r.total_pnl)}</span></div>
         <div class="brow"><span class="brow-label">Today P&L %</span><span class="brow-val ${todayClass}">${fmtPnl(r.today_pnl)}</span></div>
-        <div class="brow"><span class="brow-label">Win Rate</span><span class="brow-val">${r.win_rate}%</span></div>
+        <div class="brow"><span class="brow-label">Win Rate (уник.)</span><span class="brow-val">${r.wr_unique}%</span></div>
         <div class="brow"><span class="brow-label">Net+ / Net− / BE</span><span class="brow-val">${r.profitable} / ${r.net_losses} / ${r.breakeven}</span></div>
         <div class="brow"><span class="brow-label">Открытые</span><span class="brow-val cyan">${r.open_count}</span></div>
         <div class="brow"><span class="brow-label">Всего сделок</span><span class="brow-val">${r.total}</span></div>
@@ -1268,7 +1361,7 @@ function renderChart(dailyPnl) {
       datasets: [
         {
           type: 'bar',
-          label: 'Σ trade P&L % день',
+          label: 'Σ P&L % день (no-lev, уник.)',
           data: barData,
           backgroundColor: colors,
           borderColor: colors.map(c => c.replace('0.5', '0.9')),
@@ -1277,7 +1370,7 @@ function renderChart(dailyPnl) {
         },
         {
           type: 'line',
-          label: 'Кум. Σ trade P&L %',
+          label: 'Кум. Σ P&L % (no-lev, уник.)',
           data: cumData.map(d => d.y),
           borderColor: '#6366f1',
           backgroundColor: 'rgba(99,102,241,0.1)',
